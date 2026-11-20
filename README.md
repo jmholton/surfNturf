@@ -2,11 +2,11 @@
 
 **Differentiable multi-conformer crystal hydration (*Surf*), conformer reconnection (*Turf*), 3D water mobility $B(\mathbf{x})$, and X-ray bulk-solvent modelling.**
 
-Traditional crystallographic bulk-solvent models place a flat step mask at an arbitrary van der Waals offset around the macromolecule (`k_sol`, `b_sol`). Real crystal solvent is neither flat nor binary: polar hydrogen-bond donors and acceptors carve sharp first-shell hydration peaks, hydrophobic patches create depletion moats, water–water packing generates oscillatory second shells around `2.8 Å` and `4.5 Å`, and alternate macromolecular conformers (*Turf*) displace solvent (*Surf*) in mutually exclusive pockets.
+The classic shrunken continuum bulk-solvent mask (`r_probe`, `r_shrink`, and resolution-dependent `k_mask(s)` / `B_sol`; Jiang & Brünger 1994; Fokine & Urzhumtsev 2002; Afonine et al. 2005, 2013) has been a cornerstone of macromolecular crystallography for over three decades—capturing low-angle solvent scattering robustly with minimal parameters via a single compromise boundary (`r_vdW + r_probe - r_shrink ≈ r_vdW + 0.2 Å`). Between `~4 Å` and atomic resolution, however, crystal solvent exhibits rich local structure beyond a uniform continuum: polar donors and acceptors organize sharp first and second hydration shells, hydrophobic groups create wider (`~3.4 Å`) van der Waals depletion zones, alternate macromolecular conformers (*Turf*) share pockets with partial-occupancy water (*Surf*), and water mobility $B(\mathbf{x})$ spans two orders of magnitude from tethered clefts to open channels.
 
-**surfNturf** replaces the flat step mask with a fast, analytically differentiable, space-group-exact hydration field trained once on explicit-water crystal MD and transferable in seconds to any single-conformer, multi-altloc, or multi-model crystal structure — with **zero MD simulation required at application time**.
+Building directly on `phenix.refine`'s user-supplied `FPART / PHIPART` solvent framework, **surfNturf** extends the continuum mask with a fast, analytically differentiable, space-group-exact hydration field trained once on explicit-water crystal MD and transferable in seconds to any single-conformer, multi-altloc, or multi-model crystal structure — with **zero MD simulation required at application time**.
 
-![Standard Flat Bulk-Solvent Mask vs. surfNturf](docs/flat_vs_surfnturf.svg)
+![From the Shrunken Continuum Mask to Structured Crystal Hydration](docs/flat_vs_surfnturf.svg)
 
 ---
 

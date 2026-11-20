@@ -4,21 +4,21 @@
 
 ---
 
-## 1. Why the Flat Step Mask Fails Physically
+## 1. From the Shrunken Continuum Mask to Structured Hydration
 
-Standard macromolecular refinement programs represent disordered crystal solvent with a binary step mask (`k_sol`, `b_sol` or per-shell `k_mask`):
+For over three decades, macromolecular refinement has modeled disordered crystal solvent with the rolled-probe and shrunken continuum mask (Jiang & Brünger 1994; Fokine & Urzhumtsev 2002; Afonine et al. 2005, 2013):
 $$F_{\text{model}}(\mathbf{h}) = k_{\text{total}}(\mathbf{h})\Big[F_{\text{calc}}(\mathbf{h}) + k_{\text{mask}}(s)\,F_{\text{mask}}(\mathbf{h})\Big],$$
-where $\rho_{\text{mask}}(\mathbf{x})$ jumps discontinuously from $0$ to $\rho_{\text{bulk}} \approx 0.3344\text{ e/\AA}^3$ at an arbitrary van der Waals probe/shrink surface around all macromolecular atoms.
+where a probe sphere of radius $r_{\text{probe}} \approx 1.1\text{ \AA}$ defines the solvent-accessible boundary around heavy atoms and a morphological shrink radius $r_{\text{shrink}} \approx 0.9\text{ \AA}$ pulls convex boundaries back to $r_{\text{vdW}} + (r_{\text{probe}} - r_{\text{shrink}}) \approx r_{\text{vdW}} + 0.2\text{ \AA}$, scaled across resolution shells by $k_{\text{mask}}(s)$ (or $k_{\text{sol}} e^{-B_{\text{sol}} s^2}$).
 
-Five physical approximations break down in that picture:
+At low resolution ($d \gtrsim 4.5\text{--}6\text{ \AA}$), this time-honored formulation is remarkably effective, fast, and parameter-frugal: $r_{\text{shrink}} \approx 0.9\text{ \AA}$ acts as a well-tuned single-surface geometric compromise between close polar H-bonding contacts and wider nonpolar van der Waals exclusion. Between `~4 Å` and atomic resolution—where individual hydration shells and alternate conformers contribute strongly to structure factors—extending the uniform continuum introduces five physical refinements:
 
-1. **Chemical blindness at the first shell:** An anionic Asp/Glu carboxylate oxygen (`O...O_w ≈ 2.65 Å`) or polar amide `N–H` donor (`H...O_w ≈ 1.85 Å`) recruits sharp first-shell hydration peaks reaching `5–25×` bulk water density, whereas an aliphatic methyl group repels water out to `3.5–3.8 Å`. A binary mask places the boundary at roughly the same offset around both and sets the peak height to `1×` bulk everywhere.
-2. **Absence of liquid packing (second-shell oscillations):** Liquid water has finite molecular diameter (`~2.8 Å`). A strongly pinned first-shell water sterically *excludes* other water oxygens from an annular moat (`1.2–2.3 Å`) while hydrogen-bonding to a *second* hydration shell at `2.8 Å` and `4.5 Å`.
-3. **Point-atom water scattering:** A water molecule (`O + 2H`) is not a spherical `10 e` atom. Near hydrogen-bond acceptors (`C=O`, `COO-`), water points a proton inward by `r_OH = 0.9572 Å`, shifting positive electron density ~`1 Å` closer to the protein surface without changing total electron count.
-4. **Mutual exclusion with alternate conformers (*Turf*):** Union solvent masks carve permanent vacuum cavities around every minor side-chain altloc (starving `70–80%`-occupied water sites that exist whenever the side chain is in its major state), whereas major-only masks place bulk water straight inside minor conformers.
-5. **Single scalar $B_{\text{sol}}$:** Crystallographic water mobility spans more than two orders of magnitude within the same unit cell—from `B ≈ 4–10 Å²` (`FWHM ≈ 0.5–0.8 Å`) in multi-tethered surface clefts to `B ≈ 150–800 Å²` (`FWHM ≈ 3.3–7.5 Å`) in wide solvent channels. Blurring the entire mask with one scalar `B_sol ≈ 45 Å²` simultaneously washes out real `3.5–1.5 Å` hydration shells and leaves low-angle bulk channels under-blurred.
+1. **Chemically specific onset & first-shell peaks:** Because a single `(r_probe, r_shrink)` offset must balance all surface elements simultaneously, shrinking to `r_vdW + 0.2 Å` (`~1.7 Å` on `O`, `~2.15 Å` on `C`) brings continuum density inside the `2.1–3.4 Å` hydrophobic exclusion zone around aliphatic carbons while still capping `5–20×` polar H-bond peaks (`O...O_w ≈ 2.65 Å`, `H...O_w ≈ 1.85 Å`) at $1\times$ bulk (`0.334 e/Å³`).
+2. **Liquid water–water packing (second-shell oscillations):** Finite water molecular size (`~2.8 Å`) creates an annular exclusion trough (`1.2–2.3 Å`) around pinned first-shell waters together with cooperative `2.8 Å` and `4.5 Å` second- and third-shell bridges.
+3. **Molecular `(O + 2H)` charge distribution:** Near hydrogen-bond acceptors (`C=O`, `COO-`), water molecules orient a proton inward by `r_OH = 0.9572 Å`, shifting electron density ~`1 Å` closer to the acceptor without changing total electron count (`F000`).
+4. **Ensemble averaging across alternate conformers (*Turf*):** A single union mask treats minor conformers (`occ < 1`) with full steric exclusion, leaving zero continuum density at partial-occupancy water sites displaced by minor side-chain rotamers, whereas per-conformer hydration weights solvent naturally in proportion to `1 - occ`.
+5. **Spatially varying 3D mobility $B(\mathbf{x})$:** Rather than applying one global $B_{\text{sol}}$ (or isotropic shell profile $k_{\text{mask}}(s)$) everywhere in the unit cell, local water mobility varies smoothly from `B ≈ 4–10 Å²` in multi-tethered clefts to `B ≈ 150–800 Å²` in wide solvent channels.
 
-`surfNturf` replaces these approximations with six physically coupled, analytically differentiable layers.
+`surfNturf` builds on the `FPART / PHIPART` bulk-solvent architecture to model these effects through six coupled, analytically differentiable layers.
 
 ---
 
@@ -27,9 +27,9 @@ Five physical approximations break down in that picture:
 X-ray diffraction amplitudes measure the coherent space-and-time average across unit cells in the crystal mosaic. When a macromolecule populates $M$ complete conformational states with weights $w_m$ ($\sum_{m=1}^M w_m = 1$), each conformer $m$ carves its own steric and electrostatic cavity and equilibrates with its own conditional hydration distribution $\rho_{\text{solv}}^{(m)}(\mathbf{x})$:
 $$\langle \rho_{\text{solv}}(\mathbf{x}) \rangle = \sum_{m=1}^M w_m\,\rho_{\text{solv}}^{(m)}(\mathbf{x}).$$
 
-Because steric exclusion $\exp(-U_0^{(m)}(\mathbf{x}))$ is strongly nonlinear, **averaging density across complete conformers is fundamentally different from evaluating one hydration field on occupancy-weighted atoms**:
+Because steric exclusion $\exp(-U_0^{(m)}(\mathbf{x}))$ is strongly nonlinear, **averaging density across complete conformers differs fundamentally from evaluating one hydration field on occupancy-weighted atoms**:
 $$\sum_{m=1}^M w_m\,e^{-U_0^{(m)}(\mathbf{x})} \neq \exp\!\left(-\sum_{m=1}^M w_m\,U_0^{(m)}(\mathbf{x})\right).$$
-At a pocket occupied by a side-chain rotamer in `30%` of unit cells ($U_0^{(A)} \approx +20$, $e^{-U_0^{(A)}} \approx 0$) and open to water in `70%` of unit cells ($U_0^{(B)} \approx -1.8$, $g_O^{(B)} \approx 6$), the ensemble average yields a partial-occupancy water peak $0.70 \times 6 = 4.2\times$ bulk—whereas an averaged potential $0.30(+20) + 0.70(-1.8) = +4.74$ would predict $e^{-4.74} \approx 0.009$ (erroneous vacuum!).
+At a pocket occupied by a side-chain rotamer in `30%` of unit cells ($U_0^{(A)} \approx +20$, $e^{-U_0^{(A)}} \approx 0$) and open to water in `70%` of unit cells ($U_0^{(B)} \approx -1.8$, $g_O^{(B)} \approx 6$), the ensemble average yields a partial-occupancy water peak $0.70 \times 6 = 4.2\times$ bulk—whereas a potential averaged prior to exponentiation ($0.30(+20) + 0.70(-1.8) = +4.74$) would suppress water occupancy ($e^{-4.74} \approx 0.009$).
 
 To construct the $M$ conformers:
 * **External ILP ensembles:** `surfNturf` directly ingests directories of complete conformer PDBs (`m01.pdb .. mNN.pdb`), such as those produced by global integer-linear-programming untanglers (Passmore's `Untangler`).
