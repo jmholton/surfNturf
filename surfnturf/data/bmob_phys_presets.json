@@ -1,0 +1,20 @@
+{
+  "dry_a4": {
+    "description": "6-parameter physical water mobility law fitted on DRY 32-conformer 1aho work |Fo|",
+    "alpha_prot": 2.24,
+    "B0": 0.5,
+    "dB_unteth": 17.7,
+    "gamma_teth": 2.10,
+    "B_far": 2.0,
+    "d_far": 2.80
+  },
+  "wet_b5b": {
+    "description": "6-parameter physical water mobility law fitted on WET (+HOH, pre-displaced) 32-conformer 1aho work |Fo|",
+    "alpha_prot": 3.02,
+    "B0": 1.1,
+    "dB_unteth": 12.8,
+    "gamma_teth": 2.85,
+    "B_far": 2.0,
+    "d_far": 2.80
+  }
+}
