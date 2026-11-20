@@ -26,7 +26,7 @@ Given any crystallographic structure (single-conformer, `A/B`, heterogeneous mul
    * **`surfnturf.bmob`**: Renders spatially varying water mobility $B(\mathbf{x}) \in [0.625, 2560]\text{ \AA}^2$ via a `13`-level Catmull–Rom partition-of-unity basis on $\ln B$, anchored to local protein $B_{\text{iso}}$ and H-bond tether count or refined against work-set $|F_{\text{obs}}|$.
    * **`surfnturf.divot`**: Captures crystal-specific interstitial cavities, cryoprotectant/ion pockets, and sub-voxel hydration peaks from exact `e/Å³` work-set `mFo - DFc` maps via continuous-coordinate `IT92` peaks (`ContinuousPeakDict`), Bader steepest-ascent basins (`WatershedDivotDict`), or wall-clamped mass-conserving transport (`W_mc`), with strict blind hyperparameter selection on an internal `5%` work-validation split (`FreeR_flag == 0` is never touched).
 
-Every layer has **exact hand-derived analytical reverse-mode adjoints** (BLAS `DGEMV` + Parseval 3D FFTs, verified against central finite differences to `1e-10`–`5e-7`).
+Every layer has **exact hand-derived analytical reverse-mode adjoints** (BLAS `DGEMV` + Parseval 3D FFTs, verified against central finite differences to `1e-10`–`5e-7`). For full mathematical derivations of all six layers, see [PHYSICAL_PRINCIPLES.md](PHYSICAL_PRINCIPLES.md).
 
 ---
 
