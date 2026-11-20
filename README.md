@@ -6,6 +6,8 @@ Traditional crystallographic bulk-solvent models place a flat step mask at an ar
 
 **surfNturf** replaces the flat step mask with a fast, analytically differentiable, space-group-exact hydration field trained once on explicit-water crystal MD and transferable in seconds to any single-conformer, multi-altloc, or multi-model crystal structure — with **zero MD simulation required at application time**.
 
+![Standard Flat Bulk-Solvent Mask vs. surfNturf](docs/flat_vs_surfnturf.svg)
+
 ---
 
 ## Physical Architecture (*Surf* & *Turf*)
