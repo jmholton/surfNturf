@@ -781,7 +781,10 @@ class WatershedDivotDict:
 class SolventAmplitudeProblem:
     """Evaluates |Fo| amplitude loss & gradient strictly on train_mask, reporting work_val & free R cleanly."""
 
-    P_LO = np.array([0.50, 0.00], dtype=np.float64)
+    # k_solv is floored above 0: at k_solv = 0 the gradient wrt rho (proportional to k_solv) vanishes identically,
+    # so a start whose best scale is 0 could never move and would write an all-zero FPART
+    K_SOLV_MIN = 0.05
+    P_LO = np.array([0.50, K_SOLV_MIN], dtype=np.float64)
     P_HI = np.array([1.50, 5.00], dtype=np.float64)
 
     def __init__(self, cgrid: CrystalGridOps, H, Fo, free_mask, K_scale, F_calc, train_mask=None, val_mask=None):
@@ -800,15 +803,8 @@ class SolventAmplitudeProblem:
         self.d_arr = 1.0 / np.sqrt(np.maximum(4.0 * self.stol2, 1e-12))
 
         if train_mask is None or val_mask is None:
-            work_idx = np.nonzero(self.work)[0]
-            order = work_idx[np.argsort(-self.d_arr[work_idx])]
-            val_sel = order[9::19] if len(order) >= 19 else order[-1:]
-            self.val = np.zeros(len(self.Fo), dtype=bool)
-            self.val[val_sel] = True
-            self.train = self.work & (~self.val)
-            if not np.any(self.train):
-                self.train = self.work.copy()
-                self.val = np.zeros(len(self.Fo), dtype=bool)
+            from .bmob import make_work_train_val_split
+            self.train, self.val = make_work_train_val_split(self.H, self.d_arr, self.free)
         else:
             self.train = np.asarray(train_mask, dtype=bool) & self.work
             self.val = np.asarray(val_mask, dtype=bool) & self.work
@@ -834,7 +830,11 @@ class SolventAmplitudeProblem:
         return float(np.sum(np.abs(self.Fo[sel] - np.abs(Fm[sel]))) / denom)
 
     def solve_inner_scales(self, P, sel_mask, p_init=None, nit=20):
-        """Box-constrained 2D Gauss-Newton for p = [k_prot, k_solv] in [0.50, 1.50] x [0.00, 5.00]."""
+        """Box-constrained 2D Gauss-Newton for p = [k_prot, k_solv] in [0.50, 1.50] x [K_SOLV_MIN, 5.00].
+
+        Gauss-Newton runs from each fixed start (plus `p_init` if given) and the lowest final loss wins, so the
+        result depends only on (P, sel_mask, p_init), never on earlier calls.
+        """
         lo, hi = self.P_LO, self.P_HI
         w = sel_mask
         Qw = (self.K * self.Q)[w]
@@ -846,14 +846,24 @@ class SolventAmplitudeProblem:
             return float(np.dot(res, res))
 
         cand_inits = [
-            np.clip(p_init if p_init is not None else self.p_cache, lo, hi),
             np.array([1.0, 0.0], dtype=np.float64),
             np.array([1.0, 0.35], dtype=np.float64),
             np.array([1.0, 1.0], dtype=np.float64),
         ]
-        p = min(cand_inits, key=_obj).copy()
-        cur_f = _obj(p)
+        if p_init is not None:
+            cand_inits.append(np.asarray(p_init, dtype=np.float64))
+        best_p, best_f = None, float('inf')
+        for p0 in cand_inits:
+            p_run = self._gauss_newton_scales(np.clip(p0, lo, hi), _obj, Qw, Pw, Fow, lo, hi, nit)
+            f_run = _obj(p_run)
+            if f_run < best_f:
+                best_p, best_f = p_run, f_run
+        return best_p
 
+    @staticmethod
+    def _gauss_newton_scales(p, _obj, Qw, Pw, Fow, lo, hi, nit):
+        p = np.array(p, dtype=np.float64)
+        cur_f = _obj(p)
         for _ in range(nit):
             Fm = p[0] * Qw + p[1] * Pw
             a = np.maximum(np.abs(Fm), 1e-12)
@@ -896,7 +906,7 @@ class SolventAmplitudeProblem:
         nrm = max(float(np.sum(self.Fo[use_mask] ** 2)), 1e-12)
 
         P = self.cgrid.sf(rho_3d, self.idx)
-        p = self.solve_inner_scales(P, use_mask, self.p_cache)
+        p = self.solve_inner_scales(P, use_mask)
         self.p_cache = p.copy()
         Fm = self.K * (p[0] * self.Q + p[1] * P)
         a = np.maximum(np.abs(Fm), 1e-12)
@@ -981,7 +991,7 @@ def write_fpart_cgrid(cgrid: CrystalGridOps, rho_3d, hkl_mtz_path, out_mtz_path,
 
 
 def extract_problem_from_fmodel(cgrid: CrystalGridOps, fmodel_mtz_path: str, data_mtz_path: str = None,
-                                free_flag_col: str = 'FreeR_flag'):
+                                free_flag_col: str = 'FreeR_flag', free_flag_value=None):
     """Build SolventAmplitudeProblem from a Phenix `*_f_model.mtz` file (`export_final_f_model=True`)."""
     fm = gemmi.read_mtz_file(fmodel_mtz_path)
     lbls = fm.column_labels()
@@ -1007,11 +1017,8 @@ def extract_problem_from_fmodel(cgrid: CrystalGridOps, fmodel_mtz_path: str, dat
     if int(np.sum(valid)) < 2:
         raise ValueError(f"{fmodel_mtz_path}: fewer than 2 valid positive reflections found")
 
-    uflags = set(np.unique(flags[valid]).astype(int).tolist())
-    if uflags.issubset({0, 1}) and np.mean(flags[valid] == 1) < 0.25:
-        free = (flags == 1)
-    else:
-        free = (flags == 0)
+    from .bmob import free_mask_from_flags
+    free = free_mask_from_flags(flags, valid, free_flag_value, source_desc=fmodel_mtz_path)
 
     fc_amp = pick('FCALC', 'FCALCATOMS')
     fc_phi = pick('PHIFCALC', 'PHIFCALCATOMS')
@@ -1042,21 +1049,11 @@ def extract_problem_from_fmodel(cgrid: CrystalGridOps, fmodel_mtz_path: str, dat
     cK = float(np.median(np.abs(Fmod[nz]) / np.abs(denom[nz]))) if np.any(nz) else 1.0
     K_scale = cK * kk
 
+    from .bmob import make_work_train_val_split
     free_v = free[valid]
-    val_v = train_v = None
-    if data_mtz_path is not None and os.path.isfile(data_mtz_path):
-        dm = gemmi.read_mtz_file(data_mtz_path)
-        col_fl = dm.column_with_label(free_flag_col)
-        if col_fl is not None:
-            dm_h = dm.make_miller_array()
-            dm_fl = col_fl.array
-            fl_lookup = {tuple(h): int(round(float(v))) for h, v in zip(dm_h, dm_fl) if np.isfinite(v)}
-            orig_flags = np.array([fl_lookup.get(tuple(h), -1) for h in H[valid]], dtype=int)
-            if (len(np.unique(orig_flags[orig_flags >= 0])) >= 10
-                    and 0.025 < float(np.mean(orig_flags == 1)) < 0.085
-                    and not np.any((orig_flags == 1) & free_v)):
-                val_v = (orig_flags == 1)
-                train_v = (~free_v) & (~val_v)
+    train_v, val_v = make_work_train_val_split(
+        H[valid], None, free_v, data_mtz_path=data_mtz_path, free_flag_col=free_flag_col, spacegroup=cgrid.sg
+    )
 
     return SolventAmplitudeProblem(
         cgrid, H[valid], Fo[valid], free_v, K_scale[valid], Fc[valid],
@@ -1115,7 +1112,14 @@ def fit_scale_divot_peak_given_hp(prob: SolventAmplitudeProblem, cgrid: CrystalG
                                    z_thresh=3.4, lam_l1=4e-5, rs=1e-4, n_passes=1, max_peaks_per_pass=90,
                                    maxiter_s0=60, maxiter_joint=130):
     """Fit S(x)*base(x) + WatershedDivots + ContinuousPeakDict strictly on active_mask (NEVER free!)."""
-    pf_s = PeriodicFourierFields(cgrid, base_3d, fitreso_s=fitreso_s, use_scale=True, use_warp=False)
+    d_min_p = float(np.min(prob.d_arr)) if len(prob.d_arr) else 1.0
+    fitreso_eff = max(float(fitreso_s), round(4.0 * d_min_p, 2)) if d_min_p > 1.50 else float(fitreso_s)
+    b_lo = max(6.0, round(3.0 * (d_min_p ** 2), 1)) if d_min_p > 1.45 else 6.0
+    b_hi = max(22.0, round(8.0 * (d_min_p ** 2), 1)) if d_min_p > 1.45 else 22.0
+    rmax_eff = max(2.2, round(1.3 * d_min_p, 2)) if d_min_p > 1.70 else 2.2
+    min_sep_eff = max(1.35, round(0.85 * d_min_p, 2)) if d_min_p > 1.60 else 1.35
+
+    pf_s = PeriodicFourierFields(cgrid, base_3d, fitreso_s=fitreso_eff, use_scale=True, use_warp=False)
 
     def obj_s0(cs):
         rho_s, _, _, pb_s = pf_s.forward_and_pullback(cs, compute_grad=True)
@@ -1125,7 +1129,8 @@ def fit_scale_divot_peak_given_hp(prob: SolventAmplitudeProblem, cgrid: CrystalG
     res_s0 = minimize(obj_s0, np.zeros(pf_s.nx), method='L-BFGS-B', jac=True,
                       bounds=[(-2.5, 2.5)] * pf_s.nx, options={'maxiter': maxiter_s0, 'ftol': 1e-10})
     cs_cur = res_s0.x.copy()
-    rho_cur, _, _, _ = pf_s.forward_and_pullback(cs_cur, compute_grad=False)
+    rho_s_only, _, _, _ = pf_s.forward_and_pullback(cs_cur, compute_grad=False)
+    rho_cur, _ = softplus_pos(rho_s_only, tau=0.012) if n_passes == 0 else (rho_s_only, None)
 
     all_peak_seeds = []
     all_peak_params = np.zeros(0, dtype=np.float64)
@@ -1133,21 +1138,21 @@ def fit_scale_divot_peak_given_hp(prob: SolventAmplitudeProblem, cgrid: CrystalG
     w_div_cur = np.zeros(0, dtype=np.float64)
 
     for p_idx in range(n_passes):
-        dmap_8 = prob.compute_work_diff_map(rho_cur, active_mask=active_mask, B_smooth=6.0)
-        dmap_22 = prob.compute_work_diff_map(rho_cur, active_mask=active_mask, B_smooth=22.0)
+        dmap_8 = prob.compute_work_diff_map(rho_cur, active_mask=active_mask, B_smooth=b_lo)
+        dmap_22 = prob.compute_work_diff_map(rho_cur, active_mask=active_mask, B_smooth=b_hi)
 
         if use_divots and p_idx == 0:
             wdiv = WatershedDivotDict(
                 cgrid, dmap_8, open_mask_3d,
-                z_peak=max(2.5, z_thresh - 0.3), z_floor=1.6, rmax_A=2.2, max_divots=180, smooth_B=2.5
+                z_peak=max(2.5, z_thresh - 0.3), z_floor=1.6, rmax_A=rmax_eff, max_divots=180, smooth_B=2.5
             )
             w_div_cur = np.zeros(wdiv.K, dtype=np.float64)
 
         if use_peaks:
             new_seeds = pick_asu_difference_peaks(
-                cgrid, [(6.0, dmap_8), (22.0, dmap_22)], open_mask_3d,
+                cgrid, [(b_lo, dmap_8), (b_hi, dmap_22)], open_mask_3d,
                 z_thresh=(z_thresh if p_idx == 0 else z_thresh + 0.2),
-                max_peaks=max_peaks_per_pass, min_sep_A=1.35
+                max_peaks=max_peaks_per_pass, min_sep_A=min_sep_eff
             )
             if all_peak_seeds and new_seeds:
                 prev_pdict = ContinuousPeakDict(cgrid, all_peak_seeds)
@@ -1258,11 +1263,28 @@ def fit_scale_divot_peak_given_hp(prob: SolventAmplitudeProblem, cgrid: CrystalG
 
 def fit_adaptive_divot_peak_blind(prob: SolventAmplitudeProblem, cgrid: CrystalGridOps, base_3d, open_mask_3d,
                                   fitreso_s=10.0, use_divots=True, use_peaks=True, n_passes=1,
-                                  hp_grid=((3.8, 8e-5), (3.3, 3e-5), (2.9, 1.2e-5))):
-    """Select (z_thresh, lam_l1) strictly on work_val (blind to FreeR_flag==0!), then refit once on 100% work!"""
+                                  hp_grid=None, gate_on_val: bool = True, min_rval_gain: float = 1e-4):
+    """Select (base vs scale_only vs (z_thresh, lam_l1)) strictly on work_val (blind to FreeR_flag==0!)."""
     t0 = time.time()
+    d_min_p = float(np.min(prob.d_arr)) if len(prob.d_arr) else 1.0
+    if hp_grid is None:
+        if d_min_p >= 1.35:
+            hp_grid = ((4.4, 2.0e-4), (3.8, 8e-5), (3.3, 3e-5), (2.9, 1.2e-5))
+        else:
+            hp_grid = ((3.8, 8e-5), (3.3, 3e-5), (2.9, 1.2e-5))
+
+    ev_base = prob.eval_rho(base_3d, active_mask=prob.train, compute_grad=False)
+    rval_base = ev_base['r_val'] if math.isfinite(ev_base['r_val']) else ev_base['r_train']
+
+    _, inf_s0 = fit_scale_divot_peak_given_hp(
+        prob, cgrid, base_3d, open_mask_3d, active_mask=prob.train,
+        fitreso_s=fitreso_s, use_divots=False, use_peaks=False,
+        z_thresh=9.9, lam_l1=1e-3, n_passes=0, maxiter_s0=45, maxiter_joint=1
+    )
+    rval_scale = inf_s0['r_val'] if math.isfinite(inf_s0['r_val']) else inf_s0['r_train']
+
     best_hp = tuple(hp_grid[0])
-    best_rval = float('inf')
+    best_hp_rval = float('inf')
     val_trace = []
 
     for z_t, l1_w in hp_grid:
@@ -1274,17 +1296,58 @@ def fit_adaptive_divot_peak_blind(prob: SolventAmplitudeProblem, cgrid: CrystalG
         )
         val_trace.append((z_t, l1_w, inf['r_train'], inf['r_val'], inf['n_divots_act'], inf['n_peaks_act']))
         score_val = inf['r_val'] if math.isfinite(inf['r_val']) else inf['r_train']
-        if score_val < best_rval:
-            best_rval = score_val
+        if score_val < best_hp_rval:
+            best_hp_rval = score_val
             best_hp = (z_t, l1_w)
 
-    rho_final, info_final = fit_scale_divot_peak_given_hp(
-        prob, cgrid, base_3d, open_mask_3d, active_mask=prob.work,
-        fitreso_s=fitreso_s, use_divots=use_divots, use_peaks=use_peaks,
-        z_thresh=best_hp[0], lam_l1=best_hp[1], n_passes=n_passes, max_peaks_per_pass=130,
-        maxiter_s0=60, maxiter_joint=140
-    )
-    info_final['r_val'] = float(best_rval)
+    if gate_on_val and np.any(prob.val):
+        best_stage = 'base'
+        best_rval = float(rval_base)
+        if rval_scale < best_rval - float(min_rval_gain):
+            best_stage = 'scale_only'
+            best_rval = float(rval_scale)
+        if best_hp_rval < best_rval - float(min_rval_gain):
+            best_stage = 'divot_peak'
+            best_rval = float(best_hp_rval)
+    else:
+        best_stage = 'divot_peak'
+        best_rval = float(best_hp_rval)
+
+    if best_stage == 'base':
+        rho_final = np.asarray(base_3d, dtype=np.float64).copy()
+        ev_w = prob.eval_rho(rho_final, active_mask=prob.work, compute_grad=False)
+        info_final = {
+            'selected_stage': 'base',
+            'z_thresh': None,
+            'lam_l1': None,
+            'n_divots_tot': 0,
+            'n_divots_act': 0,
+            'n_peaks_tot': 0,
+            'n_peaks_act': 0,
+            'r_train': ev_w['r_train'],
+            'r_val': float(best_rval),
+        }
+    elif best_stage == 'scale_only':
+        rho_final, info_final = fit_scale_divot_peak_given_hp(
+            prob, cgrid, base_3d, open_mask_3d, active_mask=prob.work,
+            fitreso_s=fitreso_s, use_divots=False, use_peaks=False,
+            z_thresh=9.9, lam_l1=1e-3, n_passes=0, maxiter_s0=60, maxiter_joint=1
+        )
+        info_final['selected_stage'] = 'scale_only'
+        info_final['r_val'] = float(best_rval)
+    else:
+        rho_final, info_final = fit_scale_divot_peak_given_hp(
+            prob, cgrid, base_3d, open_mask_3d, active_mask=prob.work,
+            fitreso_s=fitreso_s, use_divots=use_divots, use_peaks=use_peaks,
+            z_thresh=best_hp[0], lam_l1=best_hp[1], n_passes=n_passes, max_peaks_per_pass=130,
+            maxiter_s0=60, maxiter_joint=140
+        )
+        info_final['selected_stage'] = 'divot_peak'
+        info_final['r_val'] = float(best_rval)
+
+    info_final['r_val_base'] = float(rval_base)
+    info_final['r_val_scale'] = float(rval_scale)
+    info_final['r_val_best_hp'] = float(best_hp_rval)
     info_final['dt_s'] = round(time.time() - t0, 1)
     info_final['val_trace'] = val_trace
     return rho_final, info_final

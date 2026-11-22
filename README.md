@@ -16,16 +16,16 @@ Given any crystallographic structure (single-conformer, `A/B`, heterogeneous mul
 
 1. **Conformer Completion — *Turf* (`surfnturf.reconnect` or external `m*.pdb` ensembles):**
    Accepts pre-untangled conformer directories (`m01.pdb .. mNN.pdb`) directly, or expands heterogeneous multi-altloc PDB/mmCIF files on the fly into $M$ (default `32`) sterically compatible complete conformers via a fast Kuhn–Munkres Hungarian + interval-cut heuristic (`surfnturf reconnect`), filtering riding-H ghost altlocs, preserving DNA/disulfide/metal/glycan bonds, and re-bisecting cross-letter amide `H/D` atoms.
-2. **10-Class Protonation-Aware Solute–Water PMF (`140` spline parameters):**
-   Separates explicit polar donor hydrogens (`H_pol` at `1.85 Å`, cationic `H_pos` at `1.78 Å`), nonpolar `C–H` (`H_apol`), anionic carboxylate/coordinating ions (`O_neg`), carbonyl (`O_carb`), hydroxyl/aromatic-acceptor (`O_hyd`), donor `N` / large polar ions (`N_don`), `C_sp2` / `P`, `C_sp3`, and `S_sul` / `Se` using $C^2$ cardinal cubic B-splines on `[1.40, 5.60 Å]`.
-3. **Grand-Canonical Langmuir Saturation (`1` parameter):**
+2. **10-Class Protonation-Aware Solute–Water PMF + Explicit $sp^2 / sp^3$ Lone Pairs (`182` spline parameters; optional `+Epol`):**
+   Separates explicit polar donor hydrogens (`H_pol` at `1.85 Å`, cationic `H_pos` at `1.78 Å`), nonpolar `C–H` (`H_apol`), anionic carboxylate/coordinating ions (`O_neg`), carbonyl (`O_carb`), hydroxyl/aromatic-acceptor (`O_hyd`), donor `N` / large polar ions (`N_don`), `C_sp2` / `P`, `C_sp3`, and `S_sul` / `Se`—augmented with explicit lone-pair virtual sites at $d_{\text{LP}} = 0.65\text{ \AA}$ (`LP_sp2` at $120^\circ$ on `C=O` / aromatic `N`, `LP_neg` on `COO-`, and tetrahedral `LP_sp3` at $109.47^\circ$ on `OH`) using $C^2$ cardinal cubic B-splines on `[1.40, 5.60 Å]`. Screened AMBER-charge crystal electric-field polarization (`+Epol`, `3` parameters) is also included and off by default (`surfnturf train --epol`).
+3. **Grand-Canonical Langmuir Saturation (`1` parameter) + Rosenfeld 0D Cavity Cap (`0` parameters):**
    $$g_1^{(m)}(\mathbf{x}) = \frac{1}{\alpha}\,\sigma\!\left(\ln\frac{\alpha}{1-\alpha} - U_0^{(m)}(\mathbf{x})\right)$$
-   Multi-tethered groove waters cooperate multiplicatively while saturating smoothly at physical single-site occupancy (`1/\alpha`).
-4. **1-FFT Ornstein–Zernike Water–Water Packing (`5` parameters) & Acceptor Water-H Polarization (`27` parameters):**
-   Convolves ensemble-averaged first-shell excess density with radial Gaussian shells (`1.25, 1.90, 2.80, 3.60, 4.50 Å`) to create the `1.9 Å` exclusion moat around pinned waters and `2.8 Å` second-shell H-bond bridges, plus a strictly zero-net-charge (`f_H(0) = 0`) acceptor-directed water-hydrogen polarization term.
-5. **Exact `IT92` `(O + 2H)` Fourier Rendering, 3D Mobility $B(\mathbf{x})$, and Sparse `PeakDict` / `WatershedDivotDict`:**
+   Multi-tethered groove waters cooperate multiplicatively while a parameter-free Rosenfeld 0D exclusion cavity cap ($r_{\text{cav}} = 1.30\text{ \AA}$, diameter $2.60\text{ \AA} < d_{\text{OO},\min}$) enforces $\le 1$ water molecule (`~10 e`) per exclusion sphere.
+4. **4-Step Tetrahedral ($109.47^\circ$) Ornstein–Zernike Network Closure (`9` parameters) & Acceptor Water-H Polarization (`27` parameters):**
+   Iterates $K = 4$ damped self-consistent steps combining 5 radial Gaussian shells (`1.25..4.50 Å`) with exact spherical-harmonic ($l = 0, 1, 2$) Stillinger–Weber / mW 3-body tetrahedral coordination on the `2.80 Å` H-bond shell (with exact analytical empty-bulk offset subtraction so $\bar{g}_O(\infty) \equiv 1.000$), resolving 1- and 2-tethered ordered waters alongside a strictly zero-net-charge (`f_H(0) = 0`) acceptor-directed water-hydrogen polarization term.
+5. **Exact `IT92` `(O + 2H)` Fourier Rendering, `k_mask = 1` 3D Mobility $B(\mathbf{x})$, and Sparse `PeakDict` / `WatershedDivotDict`:**
    * Renders molecular water number density into electron density (`e/Å³`) with International Tables `IT92` oxygen + orientational `2H` (`r_OH = 0.9572 Å`) form factors, conserving `F000` identically.
-   * **`surfnturf.bmob`**: Renders spatially varying water mobility $B(\mathbf{x}) \in [0.625, 2560]\text{ \AA}^2$ via a `13`-level Catmull–Rom partition-of-unity basis on $\ln B$, anchored to local protein $B_{\text{iso}}$ and H-bond tether count or refined against work-set $|F_{\text{obs}}|$.
+   * **`surfnturf.bmob`**: Renders spatially varying water mobility $B(\mathbf{x}) \in [0.625, 2560]\text{ \AA}^2$ via a `13`-level Catmull–Rom partition-of-unity basis on $\ln B$, refined against work-set $|F_{\text{obs}}|$ at strict `k_mask = 1` (`--kmask-mode fixed_one`, eliminating gauge collinearity between $B(\mathbf{x})$ and per-shell $k_{\text{mask}}(s)$).
    * **`surfnturf.divot`**: Captures crystal-specific interstitial cavities, cryoprotectant/ion pockets, and sub-voxel hydration peaks from exact `e/Å³` work-set `mFo - DFc` maps via continuous-coordinate `IT92` peaks (`ContinuousPeakDict`), Bader steepest-ascent basins (`WatershedDivotDict`), or wall-clamped mass-conserving transport (`W_mc`), with strict blind hyperparameter selection on an internal `5%` work-validation split (`FreeR_flag == 0` is never touched).
 
 Every layer has **exact hand-derived analytical reverse-mode adjoints** (BLAS `DGEMV` + Parseval 3D FFTs, verified against central finite differences to `1e-10`–`5e-7`). For full mathematical derivations of all six layers, see [PHYSICAL_PRINCIPLES.md](PHYSICAL_PRINCIPLES.md).
@@ -90,14 +90,17 @@ surfnturf reconnect model_multialt.pdb out/members --nconf 32
 ```
 
 ### 3. Work-Set X-Ray Mobility $B(\mathbf{x})$ & Sparse Peak/Divot Refinement
-First export a 0-cycle `*_f_model.mtz` from `phenix.refine` with `output.export_final_f_model=True` (providing `FOBS`, `R_FREE_FLAGS`, `FCALC`, `PHIFCALC`, `FMASK`, `PHIFMASK`, `FMODEL`, `PHIFMODEL`, `K_MASK`, and `K_ISOTROPIC`/`K_ANISOTROPIC`):
+First export a 0-cycle `*_f_model.mtz` from `phenix.refine` with `output.export_final_f_model=True` (providing `FOBS`, `R_FREE_FLAGS`, `FCALC`, `PHIFCALC`, `FMASK`, `PHIFMASK`, `FMODEL`, `PHIFMODEL`, `K_MASK`, and `K_ISOTROPIC`/`K_ANISOTROPIC`). Both `fit-bmob` and `fit-divot` share a deterministic `90% work_train / 5% work_val / 5% FreeR==0` split, automatically complete missing riding hydrogens on H-less/partial-H PDBs, scale spatial `B(x)` smoothing with resolution (`--fwhm auto` $\to \max(3.2\text{ \AA}, 3.5\,d_{\min})$), and gate stage complexity on unseen `5% work_val` (`FreeR_flag == 0` is never touched):
 
 ```bash
-# Joint 3.2 A-coupled 3D water mobility B(x) + PMF refinement on work |Fo|:
-surfnturf fit-bmob --pdb model.pdb --fmodel-mtz score_001_f_model.mtz --out out/bmob --mode joint
+# Blind work_val-gated 3D water mobility B(x) on 90% work_train |Fo| (default --mode auto):
+surfnturf fit-bmob --pdb model.pdb --fmodel-mtz score_001_f_model.mtz --data-mtz refme.mtz --out out/bmob
 
-# Blind work_val-selected sparse PeakDict + WatershedDivotDict refinement (FreeR_flag==0 untouched):
-surfnturf fit-divot --pdb model.pdb --fmodel-mtz score_001_f_model.mtz --data-mtz refme.mtz --out out/hybrid --arm hybrid
+# Or joint 3D water mobility B(x) + PMF refinement on work |Fo|:
+surfnturf fit-bmob --pdb model.pdb --fmodel-mtz score_001_f_model.mtz --data-mtz refme.mtz --out out/bmob_joint --mode joint
+
+# Blind work_val-gated sparse PeakDict + WatershedDivotDict refinement (FreeR_flag==0 untouched):
+surfnturf fit-divot --pdb model.pdb --fmodel-mtz score_001_f_model.mtz --data-mtz refme.mtz --base-ccp4 out/bmob_solvent.ccp4 --out out/hybrid --arm hybrid
 ```
 
 ### 4. Python API

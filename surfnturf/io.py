@@ -45,17 +45,31 @@ def choose_sg_grid_shape(cell: gemmi.UnitCell, sg: gemmi.SpaceGroup, grid_spacin
 
 
 def load_saved_spec_and_theta(npz_or_variant="l2"):
-    """Load `(WaterFieldSpec, theta)` from a `.npz` path or bundled preset name ('l2' or 'kl')."""
+    """Load `(WaterFieldSpec, theta)` from a `.npz` path or bundled preset name ('l2', 'kl', 'v1_l2', 'v1_kl')."""
     npz_path = get_pretrained_weights_path(npz_or_variant)
     D = dict(np.load(npz_path, allow_pickle=True))
+    n_types = int(D["n_types"])
+    use_lp = bool(D["use_lp"]) if "use_lp" in D else (n_types == 13)
+    use_tet_oz = bool(D["use_tet_oz"]) if "use_tet_oz" in D else False
+    n_oz_steps = int(D["n_oz_steps"]) if "n_oz_steps" in D else (4 if use_tet_oz else 1)
+    use_epol = bool(D["use_epol"]) if "use_epol" in D else False
+    use_pauli_cap = bool(D["use_pauli_cap"]) if "use_pauli_cap" in D else False
+    zero_bulk_offset = bool(D["zero_bulk_offset"]) if "zero_bulk_offset" in D else False
+
     spec = WaterFieldSpec(
-        n_types=int(D["n_types"]),
+        n_types=n_types,
         use_langmuir=bool(D["use_langmuir"]),
         use_oz=bool(D["use_oz"]),
         use_hpol=bool(D["use_hpol"]),
         use_blur=bool(D["use_blur"]),
         fit_box_scale=False,
         n_datasets=1,
+        use_lp=use_lp,
+        use_tet_oz=use_tet_oz,
+        n_oz_steps=n_oz_steps,
+        use_epol=use_epol,
+        use_pauli_cap=use_pauli_cap,
+        zero_bulk_offset=zero_bulk_offset,
     )
     theta_raw = D["theta"].astype(np.float64)
     theta = theta_raw[:spec.n_params].copy()
@@ -71,6 +85,12 @@ def save_spec_and_theta(npz_path: str, spec: WaterFieldSpec, theta: np.ndarray, 
         "use_oz": np.bool_(spec.use_oz),
         "use_hpol": np.bool_(spec.use_hpol),
         "use_blur": np.bool_(spec.use_blur),
+        "use_lp": np.bool_(spec.use_lp),
+        "use_tet_oz": np.bool_(spec.use_tet_oz),
+        "n_oz_steps": np.int32(spec.n_oz_steps),
+        "use_epol": np.bool_(spec.use_epol),
+        "use_pauli_cap": np.bool_(spec.use_pauli_cap),
+        "zero_bulk_offset": np.bool_(spec.zero_bulk_offset),
         "theta": np.asarray(theta[:spec.n_params], dtype=np.float64),
     }
     if extra_meta:
@@ -80,8 +100,10 @@ def save_spec_and_theta(npz_path: str, spec: WaterFieldSpec, theta: np.ndarray, 
     return out_path
 
 
-def load_single_alt(pdb_path: str, alt_letter: str, two_type: bool = False):
+def load_single_alt(pdb_path: str, alt_letter: str, two_type: bool = False,
+                    use_lp: bool = False, return_charges: bool = False, complete_h: bool = True):
     """Extract a single conformer (`blank + alt_letter`) from a PDB/mmCIF structure."""
+    from .hydrogens import complete_conformer_hydrogens
     st = gemmi.read_structure(pdb_path)
     al = []
     matched_alt = 0
@@ -108,7 +130,15 @@ def load_single_alt(pdb_path: str, alt_letter: str, two_type: bool = False):
         )
     if not al:
         raise ValueError(f"{pdb_path}: no non-water atoms with occupancy > 0 matched altloc {alt_letter!r}")
-    return [classify_conformer_atoms(al, two_type_heavy_only=two_type)], np.array([1.0], dtype=np.float64)
+    if complete_h and not two_type:
+        al = complete_conformer_hydrogens(al)
+    wts = np.array([1.0], dtype=np.float64)
+    if return_charges:
+        x, t, q = classify_conformer_atoms(
+            al, two_type_heavy_only=two_type, use_lp=(use_lp and not two_type), return_charges=True
+        )
+        return [(x, t)], wts, [q]
+    return [classify_conformer_atoms(al, two_type_heavy_only=two_type, use_lp=(use_lp and not two_type))], wts
 
 
 def extract_ordered_waters(pdb_path: str):
@@ -133,11 +163,7 @@ def extract_ordered_waters(pdb_path: str):
 
 def displace_ordered_waters(grid: ASUGrid, total_3d: np.ndarray, wat_xyz: np.ndarray, wat_occ: np.ndarray,
                             rex_override: float = None):
-    """Displace ordered crystallographic waters from total solvent density while conserving total solvent electrons.
-
-    Solves for `r_ex` by bisection so that `sum(bulk)*vox + 8 * sum(occ_wat) * n_symops == sum(total)*vox`
-    on the exact crystal asymmetric unit.
-    """
+    """Displace ordered crystallographic waters from total solvent density while conserving total solvent electrons."""
     if len(wat_xyz) == 0:
         return total_3d.copy(), 0.0, 0.0
     vox = grid.cell.volume / float(grid.nvox)
@@ -267,10 +293,12 @@ def _sample_structure_for_target(target_path: str) -> gemmi.Structure:
 def predict_maps_for_target(target_path: str, weights="l2", B_map: float = 5.0, grid_spacing: float = 0.45,
                             exact_shape=None, alt: str = "all", nconf: int = 32, mode: str = "auto",
                             bmob_preset: str = None, members_override=None, weights_override=None,
-                            cell_override=None, sg_override=None):
+                            cell_override=None, sg_override=None, charges_override=None, complete_h: bool = True):
     """Predict `(cell, sg, grid, members, want_3d, cannot_3d, solv_3d)` for any PDB/mmCIF or member directory."""
     spec, theta = load_saved_spec_and_theta(weights)
     two_type = (spec.n_types == 2)
+    need_lp = bool(spec.use_lp)
+    need_q = bool(spec.use_epol)
 
     if bmob_preset is not None and members_override is None:
         st = _sample_structure_for_target(target_path)
@@ -279,9 +307,18 @@ def predict_maps_for_target(target_path: str, weights="l2", B_map: float = 5.0, 
             sg_override or st.spacegroup_hm,
             source_desc=str(target_path),
         )
-        members, bisos, wts = load_ensemble_with_bfac(
-            target_path, nconf=nconf, two_type_heavy_only=two_type, mode=mode, alt=alt
-        )
+        if need_q:
+            members, bisos, wts, charges = load_ensemble_with_bfac(
+                target_path, nconf=nconf, two_type_heavy_only=two_type, mode=mode, alt=alt,
+                use_lp=need_lp, return_charges=True, complete_h=complete_h,
+            )
+        else:
+            members, bisos, wts = load_ensemble_with_bfac(
+                target_path, nconf=nconf, two_type_heavy_only=two_type, mode=mode, alt=alt,
+                use_lp=need_lp, return_charges=False, complete_h=complete_h,
+            )
+            charges = None
+
         shape = (
             tuple(int(k) for k in exact_shape)
             if exact_shape is not None
@@ -289,7 +326,7 @@ def predict_maps_for_target(target_path: str, weights="l2", B_map: float = 5.0, 
         )
         grid = ASUGrid(cell, sg, shape, step=1)
         _, gO_asu, gO_m, gH_m = forward_direct(
-            spec, grid, members, wts, theta, B_map=B_map, return_per_member=True
+            spec, grid, members, wts, theta, B_map=B_map, return_per_member=True, charges=charges
         )
         mob_feat = build_mobility_features(grid, members, bisos, two_type_heavy_only=two_type)
         mob_asu = reduce_mobility_features_to_asu(mob_feat, wts)
@@ -307,6 +344,7 @@ def predict_maps_for_target(target_path: str, weights="l2", B_map: float = 5.0, 
         solv_3d = np.maximum(grid.asu_to_full_3d(g_hat_asu) * RHO_BULK, 0.0)
         return cell, sg, grid, members, want_3d, cannot_3d, solv_3d
 
+    charges = charges_override
     if members_override is not None:
         members = members_override
         wts = weights_override if weights_override is not None else np.full(len(members), 1.0 / len(members))
@@ -316,25 +354,45 @@ def predict_maps_for_target(target_path: str, weights="l2", B_map: float = 5.0, 
         cell, sg = resolve_crystal_symmetry(
             cell_override or st.cell, sg_override or st.spacegroup_hm, source_desc=str(target_path)
         )
-        members, wts = load_ensemble(target_path, two_type_heavy_only=two_type, return_weights=True)
+        if need_q:
+            members, wts, charges = load_ensemble(
+                target_path, two_type_heavy_only=two_type, return_weights=True,
+                use_lp=need_lp, return_charges=True, complete_h=complete_h,
+            )
+        else:
+            members, wts = load_ensemble(
+                target_path, two_type_heavy_only=two_type, return_weights=True,
+                use_lp=need_lp, complete_h=complete_h,
+            )
     else:
         st = gemmi.read_structure(target_path)
         cell, sg = resolve_crystal_symmetry(
             cell_override or st.cell, sg_override or st.spacegroup_hm, source_desc=str(target_path)
         )
         if alt != "all":
-            members, wts = load_single_alt(target_path, alt, two_type=two_type)
+            if need_q:
+                members, wts, charges = load_single_alt(
+                    target_path, alt, two_type=two_type, use_lp=need_lp, return_charges=True, complete_h=complete_h
+                )
+            else:
+                members, wts = load_single_alt(
+                    target_path, alt, two_type=two_type, use_lp=need_lp, complete_h=complete_h
+                )
         else:
-            members, wts = load_ensemble(target_path, nconf=nconf, two_type_heavy_only=two_type,
-                                         mode=mode, return_weights=True)
+            if need_q:
+                members, wts, charges = load_ensemble(
+                    target_path, nconf=nconf, two_type_heavy_only=two_type,
+                    mode=mode, return_weights=True, use_lp=need_lp, return_charges=True, complete_h=complete_h,
+                )
+            else:
+                members, wts = load_ensemble(
+                    target_path, nconf=nconf, two_type_heavy_only=two_type,
+                    mode=mode, return_weights=True, use_lp=need_lp, complete_h=complete_h,
+                )
 
-    if exact_shape is not None:
-        shape = tuple(int(k) for k in exact_shape)
-    else:
-        shape = choose_sg_grid_shape(cell, sg, grid_spacing)
-
+    shape = tuple(int(k) for k in exact_shape) if exact_shape is not None else choose_sg_grid_shape(cell, sg, grid_spacing)
     grid = ASUGrid(cell, sg, shape, step=1)
-    g_hat_asu, gO_asu = forward_direct(spec, grid, members, wts, theta, B_map=B_map)
+    g_hat_asu, gO_asu = forward_direct(spec, grid, members, wts, theta, B_map=B_map, charges=charges)
     want_3d = grid.asu_to_full_3d(gO_asu)
     cannot_3d = 1.0 - np.clip(want_3d / 0.5, 0.0, 1.0)
     solv_3d = np.maximum(grid.asu_to_full_3d(g_hat_asu) * RHO_BULK, 0.0)

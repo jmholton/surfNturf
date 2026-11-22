@@ -6,12 +6,15 @@ Implements two complementary mobility mechanisms:
      - Modulates first-shell excess mobility by local polar H-bond tethering N_tether^(m)(x),
      - Transitions smoothly beyond d_far (~4.5 A) to wide disordered bulk mobility B_far (up to B = 999+ A^2).
   2. Regularized |Fo| / difference-map spatial mobility field dz_asu(x) = S_ell(eta_asu):
-     - Continuous ASU log-mobility nudge field coupled across an ell = 3.2 A neighborhood.
+     - Continuous ASU log-mobility nudge field coupled across an ell = 3.2 A neighborhood, fitted under either
+       strict `kmask_mode='fixed_one'` (`k_mask == 1.000` across all shells, eliminating gauge collinearity between
+       local B(x) and per-bin k_mask(s)) or `'per_bin'`.
 
 Rendering uses a 13-level C^1 Catmull-Rom partition-of-unity basis on ln B:
     B_levels = 5.0 * 2^(k - 3)  for k = 0..12  ([0.625 .. 2560.0] A^2, exact knot at 5.0 A^2).
 """
 import glob
+import math
 import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -25,8 +28,10 @@ from scipy.special import expit
 from .field import (
     ASUGrid, WaterFieldSpec, DatasetBundle, RHO_BULK,
     R_MIN, DR, N_KNOTS, R_CUT, RH_MIN, DRH, N_HKNOTS, RH_CUT, ACCEPTOR_TYPES,
-    _COMPACT_IONS, _LARGE_POLAR_IONS, _bspline_weights, _validate_ensemble_mode,
-    softplus, classify_conformer_atoms, solv_to_fpart, fpart_grad_to_asu, fit_kmask_per_bin,
+    _COMPACT_IONS, _LARGE_POLAR_IONS, _DEFAULT_CLASS_Q, _bspline_weights, _validate_ensemble_mode,
+    _compute_epol_additive_terms, _epol_features_from_additive,
+    softplus, classify_conformer_atoms, compute_pmf_density_with_pullback,
+    solv_to_fpart, fpart_grad_to_asu, fit_kmask_per_bin,
     smoothness_penalty_and_grad, param_bounds
 )
 from .reconnect import reconnect_pdb_to_conformers
@@ -48,8 +53,8 @@ def _atom_biso_from_gemmi(a):
     return float(np.clip(b if b > 0.0 else 15.0, 0.5, 999.0))
 
 
-def classify_conformer_atoms_with_bfac(atoms_list, two_type_heavy_only=False):
-    """Classify [(res_seq, res_name, atom_name, elem, xyz, biso), ...] -> (xyz, typ, biso)."""
+def classify_conformer_atoms_with_bfac(atoms_list, two_type_heavy_only=False, use_lp=False, return_charges=False):
+    """Classify [(res_seq, res_name, atom_name, elem, xyz, biso), ...] -> (xyz, typ, biso[, q])."""
     if two_type_heavy_only:
         xyz, typ, biso = [], [], []
         for _, _, _, el, pos, b in atoms_list:
@@ -60,28 +65,64 @@ def classify_conformer_atoms_with_bfac(atoms_list, two_type_heavy_only=False):
             is_pol = (el_u in ('N', 'O') or el_u in _COMPACT_IONS or el_u in _LARGE_POLAR_IONS)
             typ.append(0 if is_pol else 1)
             biso.append(float(np.clip(b, 0.5, 999.0)))
-        return (np.array(xyz, dtype=np.float64).reshape(-1, 3),
-                np.array(typ, dtype=np.int32),
-                np.array(biso, dtype=np.float64))
+        xyz_a = np.array(xyz, dtype=np.float64).reshape(-1, 3)
+        typ_a = np.array(typ, dtype=np.int32)
+        bi_a = np.array(biso, dtype=np.float64)
+        if return_charges:
+            return xyz_a, typ_a, bi_a, np.zeros(len(typ_a), dtype=np.float64)
+        return xyz_a, typ_a, bi_a
 
     stripped = [rec[:5] for rec in atoms_list]
-    xyz_out, typ_out = classify_conformer_atoms(stripped, two_type_heavy_only=False)
-    heavy_b = [float(np.clip(rec[5], 0.5, 999.0)) for rec in atoms_list if rec[3].upper() not in ('H', 'D')]
-    hyd_b = [float(np.clip(rec[5], 0.5, 999.0)) for rec in atoms_list if rec[3].upper() in ('H', 'D')]
-    biso_out = np.array(heavy_b + hyd_b, dtype=np.float64)
+    heavy_b = [float(np.clip(rec[5], 0.5, 999.0)) for rec in atoms_list if rec[3].strip().upper() not in ('H', 'D')]
+    hyd_b = [float(np.clip(rec[5], 0.5, 999.0)) for rec in atoms_list if rec[3].strip().upper() in ('H', 'D')]
+    real_biso = np.array(heavy_b + hyd_b, dtype=np.float64)
+
+    if return_charges:
+        xyz_out, typ_out, q_out, lp_parents = classify_conformer_atoms(
+            stripped, two_type_heavy_only=False, use_lp=use_lp, return_charges=True, return_lp_parents=True
+        )
+    else:
+        xyz_out, typ_out, lp_parents = classify_conformer_atoms(
+            stripped, two_type_heavy_only=False, use_lp=use_lp, return_charges=False, return_lp_parents=True
+        )
+        q_out = None
+
+    biso_out = np.concatenate([real_biso, real_biso[lp_parents]]) if len(lp_parents) > 0 else real_biso
     assert len(biso_out) == len(xyz_out)
+    if return_charges:
+        return xyz_out, typ_out, biso_out, q_out
     return xyz_out, typ_out, biso_out
 
 
-def load_ensemble_with_bfac(path_or_dir, nconf=32, two_type_heavy_only=False, mode='auto', alt='all'):
-    """Load conformers with per-atom B_iso: returns (members_xyz_typ, members_biso, weights).
-
-    Consistent with `field.load_ensemble`:
-      - `alt != 'all'`: single conformer (`blank + alt`).
-      - `mode='auto'`: `'letters'` when active altlocs are a subset of `{'A', 'B'}`, else `'reconnect'`.
-      - `mode='letters'`, `'reconnect'` (`'reconnect_flex*'`), or `'quantiles'`.
-    """
+def load_ensemble_with_bfac(path_or_dir, nconf=32, two_type_heavy_only=False, mode='auto',
+                            alt='all', use_lp=False, return_charges=False, complete_h=True):
+    """Load conformers with per-atom B_iso: returns `(members, bisos, weights[, charges])`."""
+    from .hydrogens import complete_conformer_hydrogens
     mode = _validate_ensemble_mode(mode)
+    use_lp_eff = bool(use_lp) and (not two_type_heavy_only)
+
+    def _finish(raw_lists, wts):
+        members, bisos = [], []
+        charges = [] if return_charges else None
+        for al in raw_lists:
+            if complete_h and not two_type_heavy_only:
+                al = complete_conformer_hydrogens(al)
+            if return_charges:
+                x, t, bi, q = classify_conformer_atoms_with_bfac(
+                    al, two_type_heavy_only=two_type_heavy_only, use_lp=use_lp_eff, return_charges=True
+                )
+                members.append((x, t))
+                bisos.append(bi)
+                charges.append(q)
+            else:
+                x, t, bi = classify_conformer_atoms_with_bfac(
+                    al, two_type_heavy_only=two_type_heavy_only, use_lp=use_lp_eff, return_charges=False
+                )
+                members.append((x, t))
+                bisos.append(bi)
+        if return_charges:
+            return members, bisos, wts, charges
+        return members, bisos, wts
 
     if os.path.isdir(path_or_dir):
         files = sorted(glob.glob(os.path.join(path_or_dir, 'm*.pdb')))
@@ -89,7 +130,7 @@ def load_ensemble_with_bfac(path_or_dir, nconf=32, two_type_heavy_only=False, mo
             files = sorted(glob.glob(os.path.join(path_or_dir, '*.pdb')))
         if not files:
             raise ValueError(f"No .pdb files found in ensemble directory {path_or_dir!r}")
-        members, bisos = [], []
+        raw_lists = []
         for f in files:
             st = gemmi.read_structure(f)
             al = []
@@ -101,11 +142,9 @@ def load_ensemble_with_bfac(path_or_dir, nconf=32, two_type_heavy_only=False, mo
                         if a.occ <= 0:
                             continue
                         al.append((r.seqid.num, r.name, a.name, a.element.name, a.pos.tolist(), _atom_biso_from_gemmi(a)))
-            xyz, typ, bi = classify_conformer_atoms_with_bfac(al, two_type_heavy_only=two_type_heavy_only)
-            members.append((xyz, typ))
-            bisos.append(bi)
-        wts = np.full(len(members), 1.0 / max(len(members), 1), dtype=np.float64)
-        return members, bisos, wts
+            raw_lists.append(al)
+        wts = np.full(len(raw_lists), 1.0 / max(len(raw_lists), 1), dtype=np.float64)
+        return _finish(raw_lists, wts)
 
     st = gemmi.read_structure(path_or_dir)
 
@@ -135,8 +174,7 @@ def load_ensemble_with_bfac(path_or_dir, nconf=32, two_type_heavy_only=False, mo
             )
         if not al:
             raise ValueError(f"{path_or_dir}: no non-water atoms with occupancy > 0 matched altloc {alt!r}")
-        xyz, typ, bi = classify_conformer_atoms_with_bfac(al, two_type_heavy_only=two_type_heavy_only)
-        return [(xyz, typ)], [bi], np.array([1.0], dtype=np.float64)
+        return _finish([al], np.array([1.0], dtype=np.float64))
 
     all_alts = set()
     any_h_split_on_blank_hv = False
@@ -178,8 +216,7 @@ def load_ensemble_with_bfac(path_or_dir, nconf=32, two_type_heavy_only=False, mo
                 for a in r:
                     if a.occ > 0:
                         al.append((r.seqid.num, r.name, a.name, a.element.name, a.pos.tolist(), _atom_biso_from_gemmi(a)))
-        xyz, typ, bi = classify_conformer_atoms_with_bfac(al, two_type_heavy_only=two_type_heavy_only)
-        return [(xyz, typ)], [bi], np.array([1.0], dtype=np.float64)
+        return _finish([al], np.array([1.0], dtype=np.float64))
 
     use_letters = (mode == 'letters') or (mode == 'auto' and all_alts.issubset({'A', 'B'}))
     if use_letters:
@@ -219,14 +256,9 @@ def load_ensemble_with_bfac(path_or_dir, nconf=32, two_type_heavy_only=False, mo
                             if h_occs:
                                 mem_lists[L].extend([rec for (rec, occ, _) in by_alt_raw[L] if occ > 0])
                                 occ_lists[L].extend(h_occs)
-        members, bisos = [], []
-        for L in letters:
-            xyz, typ, bi = classify_conformer_atoms_with_bfac(mem_lists[L], two_type_heavy_only=two_type_heavy_only)
-            members.append((xyz, typ))
-            bisos.append(bi)
         wts = np.array([np.mean(occ_lists[L]) if occ_lists[L] else 1.0 for L in letters], dtype=np.float64)
         wts = wts / wts.sum()
-        return members, bisos, wts
+        return _finish([mem_lists[L] for L in letters], wts)
 
     if mode == 'auto' or mode.startswith(('reconnect', 'geometry')):
         occ_flex = 0
@@ -236,17 +268,14 @@ def load_ensemble_with_bfac(path_or_dir, nconf=32, two_type_heavy_only=False, mo
         _, confs, _ = reconnect_pdb_to_conformers(
             path_or_dir, nconf=nconf, occ_flex=occ_flex, quotas='hamilton', rebuild_h=True, add_missing_h=True
         )
-        members, bisos = [], []
-        for c in confs:
-            al = [(a['seqnum'], a['resname'], a['name'], a['elem'], list(a['pos']), float(np.clip(a['biso'], 0.5, 999.0)))
-                  for a in c]
-            xyz, typ, bi = classify_conformer_atoms_with_bfac(al, two_type_heavy_only=two_type_heavy_only)
-            members.append((xyz, typ))
-            bisos.append(bi)
-        wts = np.full(len(members), 1.0 / len(members), dtype=np.float64)
-        return members, bisos, wts
+        raw_lists = [
+            [(a['seqnum'], a['resname'], a['name'], a['elem'], list(a['pos']), float(np.clip(a['biso'], 0.5, 999.0)))
+             for a in c]
+            for c in confs
+        ]
+        wts = np.full(len(raw_lists), 1.0 / len(raw_lists), dtype=np.float64)
+        return _finish(raw_lists, wts)
 
-    # mode == 'quantiles'
     quantiles = (np.arange(nconf, dtype=np.float64) + 0.5) / nconf
     mem_recs = [[] for _ in range(nconf)]
     for ch in st[0]:
@@ -292,14 +321,8 @@ def load_ensemble_with_bfac(path_or_dir, nconf=32, two_type_heavy_only=False, mo
                 mem_recs[m].extend(blank_atoms)
                 k = min(int(np.searchsorted(cum, q, side='right')), len(letters) - 1)
                 mem_recs[m].extend(by_alt[letters[k]])
-
-    members, bisos = [], []
-    for al in mem_recs:
-        xyz, typ, bi = classify_conformer_atoms_with_bfac(al, two_type_heavy_only=two_type_heavy_only)
-        members.append((xyz, typ))
-        bisos.append(bi)
     wts = np.full(nconf, 1.0 / nconf, dtype=np.float64)
-    return members, bisos, wts
+    return _finish(mem_recs, wts)
 
 
 class MobilityFeatures:
@@ -328,7 +351,7 @@ def reduce_mobility_features_to_asu(mob_feat: MobilityFeatures, mw):
 
 
 def build_mobility_features(grid: ASUGrid, members, members_biso, two_type_heavy_only=False):
-    """Precompute per-conformer mobility anchor features on ASUGrid from heavy protein atoms."""
+    """Precompute per-conformer mobility anchor features on ASUGrid from real heavy protein atoms."""
     M = len(members)
     n_asu = grid.n_asu
     pts = grid.asu_xyz
@@ -344,7 +367,7 @@ def build_mobility_features(grid: ASUGrid, members, members_biso, two_type_heavy
             hv_mask = np.ones(len(typ), dtype=bool)
             pol_types = (typ == 0)
         else:
-            hv_mask = (typ != 4) & (typ != 5) & (typ != 8)
+            hv_mask = (typ < 10) & (typ != 4) & (typ != 5) & (typ != 8)
             pol_types = (typ == 0) | (typ == 1) | (typ == 2) | (typ == 3)
 
         hv_xyz = xyz[hv_mask]
@@ -400,7 +423,8 @@ def build_mobility_features(grid: ASUGrid, members, members_biso, two_type_heavy
 class SlimDatasetBundle:
     """Memory-efficient DatasetBundle keeping Phi_O / Phi_H in float32 (3x lower RAM on large ASU grids)."""
 
-    def __init__(self, name, grid: ASUGrid, B_map, Phi_O, Phi_H=None, steric_H=None, member_weights=None):
+    def __init__(self, name, grid: ASUGrid, B_map, Phi_O, Phi_H=None, steric_H=None,
+                 member_weights=None, F_hbsol=None, E_feats=None):
         self.name = name
         self.grid = grid
         self.B_map = float(B_map)
@@ -416,22 +440,30 @@ class SlimDatasetBundle:
         self.Phi_H_f32 = np.ascontiguousarray(Phi_H, dtype=np.float32) if Phi_H is not None else None
         self.Phi_H_2d_f32 = self.Phi_H_f32.reshape(self.M * grid.n_asu, -1) if self.Phi_H_f32 is not None else None
         self.steric_H_64 = np.ascontiguousarray(steric_H, dtype=np.float64) if steric_H is not None else None
+        self.F_hbsol = F_hbsol
+        self.E_feats_2d = (np.ascontiguousarray(E_feats, dtype=np.float64).reshape(self.M * grid.n_asu, 3)
+                           if E_feats is not None else None)
         self.Phi_O_flat = None
         self.Phi_H_flat = None
 
 
-def fast_build_asu_and_mobility(grid: ASUGrid, members, members_biso, n_types=10, include_hpol=True, max_workers=8):
-    """Build (Phi_O, Phi_H, steric_H, MobilityFeatures) ~50x faster by querying atoms against cKDTree(asu_xyz)."""
+def fast_build_asu_and_mobility(grid: ASUGrid, members, members_biso, n_types=10, include_hpol=True,
+                                include_tet_oz=False, include_epol=False, charges=None,
+                                member_weights=None, return_extra=False, max_workers=8):
+    """Build `(Phi_O, Phi_H, steric_H, MobilityFeatures[, extra])` ~50x faster via `cKDTree(asu_xyz)`."""
     M = len(members)
     n_asu = grid.n_asu
     pts = grid.asu_xyz
-    n_feat = n_types * N_KNOTS
+    n_feat = int(n_types) * N_KNOTS
     nhf = len(ACCEPTOR_TYPES) * N_HKNOTS
-    two_type = (n_types == 2)
+    two_type = (int(n_types) == 2)
+    vox_vol = float(grid.cell.volume) / float(grid.nvox)
 
     Phi_O = np.zeros((M, n_asu, n_feat), dtype=np.float32)
     Phi_H = np.zeros((M, n_asu, nhf), dtype=np.float32) if include_hpol else None
     steric_H = np.ones((M, n_asu), dtype=np.float32) if include_hpol else None
+    E_feats = np.zeros((M, n_asu, 3), dtype=np.float32) if include_epol else None
+    sol_hb_m = np.zeros((M, n_asu), dtype=np.float64) if include_tet_oz else None
 
     d_min = np.full((M, n_asu), 15.0, dtype=np.float64)
     B_prot = np.zeros((M, n_asu), dtype=np.float64)
@@ -443,10 +475,15 @@ def fast_build_asu_and_mobility(grid: ASUGrid, members, members_biso, n_types=10
     def _work_one(m):
         xyz, typ = members[m]
         biso = members_biso[m]
+        if int(n_types) == 10 and np.any(typ >= 10):
+            keep_use = typ < 10
+            xyz_use, typ_use, biso_use = xyz[keep_use], typ[keep_use], biso[keep_use]
+        else:
+            xyz_use, typ_use, biso_use = xyz, typ, biso
 
-        SX, Si = grid.sym_expand(xyz, cutoff_A=R_CUT)
-        St = typ[Si]
-        Sb = biso[Si]
+        SX, Si = grid.sym_expand(xyz_use, cutoff_A=R_CUT)
+        St = typ_use[Si]
+        Sb = biso_use[Si]
         nb_a = tree_pts.query_ball_point(SX, R_CUT) if len(SX) else []
         lens = np.array([len(x) for x in nb_a], dtype=np.int32) if len(SX) else np.zeros(0, dtype=np.int32)
         if lens.sum() > 0:
@@ -465,43 +502,73 @@ def fast_build_asu_and_mobility(grid: ASUGrid, members, members_biso, n_types=10
             Phi_O[m] = buf.reshape(n_asu, n_feat).astype(np.float32)
 
             if include_hpol:
-                is_h_atom = (ti == 4) | (ti == 5) | (ti == 8)
-                r_clash = np.where(is_h_atom, 1.25, 1.55)
-                close = d < (r_clash + 0.80)
-                if np.any(close):
-                    l_excl = -np.logaddexp(0.0, -(d[close] - r_clash[close]) / 0.12)
-                    steric_H[m] = np.exp(np.bincount(pi[close], weights=l_excl, minlength=n_asu)).astype(np.float32)
+                real_m = np.ones_like(ti, dtype=bool) if two_type else (ti < 10)
+                if np.any(real_m):
+                    pr, dr, tr = pi[real_m], d[real_m], ti[real_m]
+                    is_h_atom = np.zeros_like(tr, dtype=bool) if two_type else ((tr == 4) | (tr == 5) | (tr == 8))
+                    r_clash = np.where(is_h_atom, 1.25, 1.55)
+                    close = dr < (r_clash + 0.80)
+                    if np.any(close):
+                        l_excl = -np.logaddexp(0.0, -(dr[close] - r_clash[close]) / 0.12)
+                        steric_H[m] = np.exp(np.bincount(pr[close], weights=l_excl, minlength=n_asu)).astype(np.float32)
 
-                acc_mask = ((ti == 0) | (ti == 1) | (ti == 2)) & (d < RH_CUT)
-                if np.any(acc_mask):
-                    pi_a = pi[acc_mask]
-                    d_a = d[acc_mask]
-                    ti_a = ti[acc_mask]
-                    buf_h = np.zeros(n_asu * nhf, dtype=np.float64)
-                    for kk, bw in _bspline_weights(d_a, RH_MIN, DRH, N_HKNOTS):
-                        valid = kk < N_HKNOTS
-                        if np.any(valid):
-                            flat_col = ti_a[valid] * N_HKNOTS + kk[valid]
-                            flat_idx = pi_a[valid].astype(np.int64) * nhf + flat_col
-                            buf_h += np.bincount(flat_idx, weights=bw[valid], minlength=n_asu * nhf)
-                    Phi_H[m] = buf_h.reshape(n_asu, nhf).astype(np.float32)
+                    acc_mask = ((tr == 0) if two_type else ((tr == 0) | (tr == 1) | (tr == 2))) & (dr < RH_CUT)
+                    if np.any(acc_mask):
+                        pi_a, d_a, ti_a = pr[acc_mask], dr[acc_mask], tr[acc_mask]
+                        buf_h = np.zeros(n_asu * nhf, dtype=np.float64)
+                        for kk, bw in _bspline_weights(d_a, RH_MIN, DRH, N_HKNOTS):
+                            valid = kk < N_HKNOTS
+                            if np.any(valid):
+                                flat_col = ti_a[valid] * N_HKNOTS + kk[valid]
+                                flat_idx = pi_a[valid].astype(np.int64) * nhf + flat_col
+                                buf_h += np.bincount(flat_idx, weights=bw[valid], minlength=n_asu * nhf)
+                        Phi_H[m] = buf_h.reshape(n_asu, nhf).astype(np.float32)
         else:
             pi = np.zeros(0, dtype=np.int32)
             ai = np.zeros(0, dtype=np.int32)
             d = np.zeros(0, dtype=np.float64)
             ti = np.zeros(0, dtype=np.int32)
 
+        real_atoms = np.ones(len(typ), dtype=bool) if two_type else (typ < 10)
+        xyz_r = xyz[real_atoms]
+        typ_r = typ[real_atoms]
+
+        if include_tet_oz and len(xyz_r) > 0:
+            pol_hv = (typ_r == 0) if two_type else ((typ_r == 0) | (typ_r == 1) | (typ_r == 2) | (typ_r == 3))
+            if np.any(pol_hv):
+                SP, _ = grid.sym_expand(xyz_r[pol_hv], cutoff_A=1.8)
+                if len(SP) > 0:
+                    nb_p = tree_pts.query_ball_point(SP, 1.5)
+                    lp = np.array([len(x) for x in nb_p], dtype=np.int32)
+                    if lp.sum() > 0:
+                        ap = np.repeat(np.arange(len(SP), dtype=np.int32), lp)
+                        pp = np.concatenate([np.asarray(x, dtype=np.int32) for x in nb_p if len(x)])
+                        dp = np.linalg.norm(pts[pp] - SP[ap], axis=1)
+                        sig_b = 0.40
+                        norm_vox = vox_vol / ((2.0 * math.pi * sig_b * sig_b) ** 1.5)
+                        sol_hb_m[m] = np.bincount(pp, weights=norm_vox * np.exp(-0.5 * (dp / sig_b) ** 2), minlength=n_asu)
+
+        if include_epol and len(xyz_r) > 0:
+            if charges is not None and charges[m] is not None and len(charges[m]) >= len(typ):
+                q_r = np.asarray(charges[m], dtype=np.float64)[real_atoms]
+            elif charges is not None and charges[m] is not None and len(charges[m]) == len(xyz_r):
+                q_r = np.asarray(charges[m], dtype=np.float64)
+            else:
+                q_r = _DEFAULT_CLASS_Q[np.clip(typ_r, 0, len(_DEFAULT_CLASS_Q) - 1)]
+            ex_v, ey_v, ez_v, es_v, lg_v = _compute_epol_additive_terms(grid, tree_pts, xyz_r, typ_r, q_r)
+            E_feats[m] = _epol_features_from_additive(ex_v, ey_v, ez_v, es_v, lg_v).astype(np.float32)
+
         if two_type:
-            hv_atom = np.ones(len(typ), dtype=bool)
+            hv_atom = np.ones(len(typ_use), dtype=bool)
             hv_pair = d <= 5.2
             pol_pair = (ti == 0)
         else:
-            hv_atom = (typ != 4) & (typ != 5) & (typ != 8)
-            hv_pair = (ti != 4) & (ti != 5) & (ti != 8) & (d <= 5.2)
+            hv_atom = (typ_use < 10) & (typ_use != 4) & (typ_use != 5) & (typ_use != 8)
+            hv_pair = (ti < 10) & (ti != 4) & (ti != 5) & (ti != 8) & (d <= 5.2)
             pol_pair = (ti == 0) | (ti == 1) | (ti == 2) | (ti == 3)
 
-        hv_xyz = xyz[hv_atom]
-        hv_b = biso[hv_atom]
+        hv_xyz = xyz_use[hv_atom]
+        hv_b = biso_use[hv_atom]
         SX_hv, Si_hv = grid.sym_expand(hv_xyz, cutoff_A=5.3)
         if len(SX_hv) == 0:
             mean_b = float(np.mean(hv_b)) if len(hv_b) else 12.0
@@ -541,7 +608,14 @@ def fast_build_asu_and_mobility(grid: ASUGrid, members, members_biso, n_types=10
     with ThreadPoolExecutor(max_workers=max(1, min(int(max_workers), M))) as ex:
         list(ex.map(_work_one, range(M)))
 
-    return Phi_O, Phi_H, steric_H, MobilityFeatures(d_min, B_prot, B_prot_tb32, N_tether)
+    mob_feat = MobilityFeatures(d_min, B_prot, B_prot_tb32, N_tether)
+    if not return_extra and not include_tet_oz and not include_epol:
+        return Phi_O, Phi_H, steric_H, mob_feat
+
+    mw = np.asarray(member_weights if member_weights is not None else np.full(M, 1.0 / max(M, 1)), dtype=np.float64)
+    mw = mw / mw.sum()
+    F_hbsol = np.fft.rfftn(grid.asu_to_full_3d(mw @ sol_hb_m), axes=(0, 1, 2)) if include_tet_oz else None
+    return Phi_O, Phi_H, steric_H, mob_feat, {'F_hbsol': F_hbsol, 'E_feats': E_feats}
 
 
 class PhysicalBMobSpec:
@@ -826,139 +900,6 @@ class MultiBRenderer:
         return g_hat, B_eff_asu, pullback
 
 
-def compute_pmf_density_with_pullback(spec: WaterFieldSpec, ds: DatasetBundle, theta, ds_index=0,
-                                      need_grad=True, use_f32_blas=True):
-    """Steps 1-3 of PMF+OZ: compute per-conformer (gO_m, gH_m, scale_k) and exact pullback to theta."""
-    w_pmf, logit_alpha, v_oz, w_hpol, log_k = spec.unpack(theta)
-    grid = ds.grid
-    M = ds.M
-    mw = ds.mw
-    w_fft = max(1, min(8, int(os.environ.get('OMP_NUM_THREADS', '4'))))
-
-    if getattr(ds, 'Phi_O_flat', None) is not None:
-        U0 = (ds.Phi_O_flat @ w_pmf).reshape(M, grid.n_asu)
-    elif use_f32_blas and getattr(ds, 'Phi_O_2d_f32', None) is not None:
-        U0 = (ds.Phi_O_2d_f32 @ w_pmf.astype(np.float32)).reshape(M, grid.n_asu).astype(np.float64)
-    else:
-        U0 = np.empty((M, grid.n_asu), dtype=np.float64)
-        for m in range(M):
-            U0[m] = ds.Phi_O_f32[m].astype(np.float64) @ w_pmf
-    if spec.use_langmuir:
-        alpha = float(expit(logit_alpha))
-        z0 = logit_alpha
-        sig1 = expit(z0 - U0)
-        g1_m = sig1 / alpha
-    else:
-        alpha = 0.0
-        z0 = 0.0
-        g1_m = np.exp(-np.clip(U0, -4.5, 40.0))
-
-    g1_bar = mw @ g1_m
-
-    if spec.use_oz:
-        xi_asu = softplus(g1_bar - 1.0, beta=4.0)
-        xi_3d = grid.asu_to_full_3d(xi_asu)
-        F_xi = sp_fft.rfftn(xi_3d, axes=(0, 1, 2), workers=w_fft)
-        psi_xi_3d = sp_fft.irfftn(grid.oz_kernels[:spec.n_oz] * F_xi[None, ...], s=grid.shape, axes=(1, 2, 3), workers=w_fft)
-        dU_ww_3d = np.tensordot(v_oz, psi_xi_3d, axes=(0, 0))
-        dU_ww_asu = dU_ww_3d.ravel()[grid.asu_reps]
-        U_tot = U0 + dU_ww_asu[None, :]
-        if spec.use_langmuir:
-            gO_m = expit(z0 - U_tot) / alpha
-        else:
-            gO_m = np.exp(-np.clip(U_tot, -4.5, 40.0))
-    else:
-        psi_xi_3d = None
-        U_tot = U0
-        gO_m = g1_m
-
-    has_hpol = spec.use_hpol and (getattr(ds, 'Phi_H_flat', None) is not None or getattr(ds, 'Phi_H_f32', None) is not None)
-    if has_hpol:
-        if getattr(ds, 'Phi_H_flat', None) is not None:
-            raw_h = (ds.Phi_H_flat @ w_hpol).reshape(M, grid.n_asu)
-        elif use_f32_blas and getattr(ds, 'Phi_H_2d_f32', None) is not None:
-            raw_h = (ds.Phi_H_2d_f32 @ w_hpol.astype(np.float32)).reshape(M, grid.n_asu).astype(np.float64)
-        else:
-            raw_h = np.empty((M, grid.n_asu), dtype=np.float64)
-            for m in range(M):
-                raw_h[m] = ds.Phi_H_f32[m].astype(np.float64) @ w_hpol
-        th_h = np.tanh(raw_h)
-        gH_m = ds.steric_H_64 * th_h
-    else:
-        th_h = None
-        gH_m = None
-
-    scale_k = float(np.exp(log_k[ds_index])) if spec.fit_box_scale else 1.0
-    if not need_grad:
-        return gO_m, gH_m, scale_k, None
-
-    def pullback_theta(dL_dgO_m, dL_dgH_m, dL_dlogk=0.0):
-        grad_theta = np.zeros_like(theta)
-        if spec.fit_box_scale:
-            idx_sc = spec.n_pmf + spec.n_alpha + spec.n_oz + spec.n_hpol + ds_index
-            grad_theta[idx_sc] = float(dL_dlogk)
-
-        if has_hpol and dL_dgH_m is not None:
-            dL_draw = dL_dgH_m * ds.steric_H_64 * (1.0 - th_h ** 2)
-            i0 = spec.n_pmf + spec.n_alpha + spec.n_oz
-            if getattr(ds, 'Phi_H_flat', None) is not None:
-                grad_theta[i0:i0 + spec.n_hpol] = dL_draw.ravel() @ ds.Phi_H_flat
-            elif use_f32_blas and getattr(ds, 'Phi_H_2d_f32', None) is not None:
-                grad_theta[i0:i0 + spec.n_hpol] = (dL_draw.ravel().astype(np.float32) @ ds.Phi_H_2d_f32).astype(np.float64)
-            else:
-                acc_h = np.zeros(spec.n_hpol, dtype=np.float64)
-                for m in range(M):
-                    acc_h += dL_draw[m] @ ds.Phi_H_f32[m].astype(np.float64)
-                grad_theta[i0:i0 + spec.n_hpol] = acc_h
-
-        def _dg_dU_and_dlogit(g_arr, U_arr):
-            if spec.use_langmuir:
-                return -g_arr * (1.0 - alpha * g_arr), alpha * g_arr * (1.0 - g_arr)
-            in_r = (U_arr > -4.5) & (U_arr < 40.0)
-            return np.where(in_r, -g_arr, 0.0), None
-
-        dg2_dU, dg2_dz0 = _dg_dU_and_dlogit(gO_m, U_tot)
-        dL_dUtot = dL_dgO_m * dg2_dU
-        grad_logit_alpha = float(np.sum(dL_dgO_m * dg2_dz0)) if spec.use_langmuir else 0.0
-
-        if spec.use_oz:
-            dL_ddU_asu = dL_dUtot.sum(axis=0)
-            dL_ddU_3d = grid.asu_to_full_3d(dL_ddU_asu / grid.orbit_mult)
-            grad_voz = np.array([np.sum(dL_ddU_3d * psi_xi_3d[q]) for q in range(spec.n_oz)], dtype=np.float64)
-            i_oz = spec.n_pmf + spec.n_alpha
-            grad_theta[i_oz:i_oz + spec.n_oz] = grad_voz
-
-            W_hat = np.tensordot(v_oz, grid.oz_kernels, axes=(0, 0))
-            dL_dxi_3d = sp_fft.irfftn(W_hat * sp_fft.rfftn(dL_ddU_3d, axes=(0, 1, 2), workers=w_fft),
-                                      s=grid.shape, axes=(0, 1, 2), workers=w_fft)
-            dL_dxi_asu = dL_dxi_3d.ravel()[grid.asu_reps] * grid.orbit_mult
-            dL_dg1_bar = dL_dxi_asu * expit(4.0 * (g1_bar - 1.0))
-
-            dg1_dU0, dg1_dz0 = _dg_dU_and_dlogit(g1_m, U0)
-            mw_g1 = np.outer(mw, dL_dg1_bar)
-            dL_dU0 = dL_dUtot + mw_g1 * dg1_dU0
-            if spec.use_langmuir:
-                grad_logit_alpha += float(np.sum(mw_g1 * dg1_dz0))
-        else:
-            dL_dU0 = dL_dUtot
-
-        if spec.use_langmuir:
-            grad_theta[spec.n_pmf] = grad_logit_alpha
-
-        if getattr(ds, 'Phi_O_flat', None) is not None:
-            grad_theta[:spec.n_pmf] = dL_dU0.ravel() @ ds.Phi_O_flat
-        elif use_f32_blas and getattr(ds, 'Phi_O_2d_f32', None) is not None:
-            grad_theta[:spec.n_pmf] = (dL_dU0.ravel().astype(np.float32) @ ds.Phi_O_2d_f32).astype(np.float64)
-        else:
-            acc_o = np.zeros(spec.n_pmf, dtype=np.float64)
-            for m in range(M):
-                acc_o += dL_dU0[m] @ ds.Phi_O_f32[m].astype(np.float64)
-            grad_theta[:spec.n_pmf] = acc_o
-        return grad_theta
-
-    return gO_m, gH_m, scale_k, pullback_theta
-
-
 def build_water_keep_mask_asu(grid: ASUGrid, base_g_asu, wat_xyz, wat_occ, rex_override=None):
     """Solve electron-conserving ordered-water exclusion mask keep_asu in [0, 1] on ASUGrid."""
     if wat_xyz is None or len(wat_xyz) == 0:
@@ -999,37 +940,236 @@ def build_water_keep_mask_asu(grid: ASUGrid, base_g_asu, wat_xyz, wat_occ, rex_o
     return keep_of(rex), rex
 
 
-class ReciprocalTarget:
-    """Holds work/free reflections, fixed atomic F_calc, Phenix k_total, and resolution bins for |Fo| fitting."""
+def free_mask_from_flags(flags, valid, free_flag_value=None, source_desc="R-free flags"):
+    """Return the test-set mask from an R-free flag column.
 
-    def __init__(self, hkl, f_obs, work_mask, free_mask, f_calc, k_tot, bin_idx, n_bins, d_hkl):
+    `free_flag_value` given: test = flags == value. Otherwise 0/1 flags take the minority value as test (phenix
+    writes test = 1, but a 0/1 file with test = 0 is also read correctly), and multi-valued 0..N-1 flags take 0
+    (CCP4 convention; pass `free_flag_value` for files that mark test with another value).
+    """
+    fl = np.asarray(flags, dtype=np.float64)
+    ok = np.asarray(valid, dtype=bool) & np.isfinite(fl)
+    fl_i = np.where(np.isfinite(fl), np.round(fl), -1).astype(np.int64)
+    if free_flag_value is not None:
+        return ok & (fl_i == int(free_flag_value))
+    vals, counts = np.unique(fl_i[ok], return_counts=True)
+    if len(vals) == 0:
+        return np.zeros(len(fl_i), dtype=bool)
+    if set(vals.tolist()).issubset({0, 1}) and len(vals) == 2:
+        test_val = int(vals[int(np.argmin(counts))])
+        if counts[0] == counts[1]:
+            test_val = 1
+        if test_val == 0:
+            print(f"surfnturf: {source_desc}: 0/1 flags with 0 in the minority; treating flag 0 as the test set",
+                  file=sys.stderr)
+        return ok & (fl_i == test_val)
+    if len(vals) == 1:
+        print(f"surfnturf: {source_desc}: all flags equal {int(vals[0])}; no test set", file=sys.stderr)
+        return np.zeros(len(fl_i), dtype=bool)
+    frac0 = float(np.mean(fl_i[ok] == 0))
+    if frac0 > 0.5:
+        print(f"surfnturf: {source_desc}: {100 * frac0:.0f}% of reflections have flag 0, which would be the test "
+              f"set under the CCP4 convention; pass the test-set flag value explicitly", file=sys.stderr)
+    return ok & (fl_i == 0)
+
+
+def canonical_hkl_keys(hkl, spacegroup=None):
+    """Integer key per reflection, identical for all symmetry (and Friedel) mates under `spacegroup`'s Laue group."""
+    H = np.asarray(hkl, dtype=np.int64).reshape(-1, 3)
+    rots = [np.eye(3, dtype=np.int64)]
+    if spacegroup is not None:
+        rots = [np.array(op.rot, dtype=np.int64) // op.DEN for op in spacegroup.operations().sym_ops]
+    best = None
+    for R in rots:
+        Hr = H @ R
+        for sgn in (1, -1):
+            Hs = sgn * Hr
+            key = ((Hs[:, 0] + 2048) << 24) | ((Hs[:, 1] + 2048) << 12) | (Hs[:, 2] + 2048)
+            best = key if best is None else np.maximum(best, key)
+    return best
+
+
+def _hkl_hash_mod(keys, mod):
+    """Deterministic splitmix64 hash of integer reflection keys, reduced modulo `mod`."""
+    with np.errstate(over='ignore'):
+        z = np.asarray(keys, dtype=np.uint64) + np.uint64(0x9E3779B97F4A7C15)
+        z = (z ^ (z >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
+        z = (z ^ (z >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
+        z = z ^ (z >> np.uint64(31))
+    return (z % np.uint64(mod)).astype(np.int64)
+
+
+def make_work_train_val_split(hkl, d_hkl, free_mask, data_mtz_path: str = None, free_flag_col: str = 'FreeR_flag',
+                              spacegroup=None):
+    """Deterministic 90% work_train / 5% work_val split strictly disjoint from free_mask.
+
+    With a data MTZ carrying 0..19 FreeR flags (and flag 1 disjoint from the free set), work_val = flag 1.
+    Otherwise each work reflection is assigned by a hash of its symmetry-canonical Miller index (1 in 19 to
+    work_val), so the split depends only on the reflection itself: it is the same in every program, in every
+    file of the same data, and does not change when other reflections are added or removed. `d_hkl` is unused
+    and kept for call compatibility.
+    """
+    H = np.asarray(hkl, dtype=np.int64)
+    free_v = np.asarray(free_mask, dtype=bool)
+    work_v = ~free_v
+    keys = canonical_hkl_keys(H, spacegroup)
+
+    if data_mtz_path is not None:
+        if not os.path.isfile(data_mtz_path):
+            print(f"surfnturf: data MTZ {data_mtz_path!r} not found; using the hashed work_val split",
+                  file=sys.stderr)
+        else:
+            dm = gemmi.read_mtz_file(data_mtz_path)
+            col_fl = dm.column_with_label(free_flag_col)
+            reason = None
+            if col_fl is None:
+                reason = f"no {free_flag_col!r} column"
+            else:
+                dm_keys = canonical_hkl_keys(np.asarray(dm.make_miller_array(), dtype=np.int64), spacegroup)
+                dm_fl = np.asarray(col_fl.array, dtype=np.float64)
+                fl_lookup = {int(k): int(round(float(v))) for k, v in zip(dm_keys, dm_fl) if np.isfinite(v)}
+                orig_flags = np.array([fl_lookup.get(int(k), -1) for k in keys], dtype=int)
+                if len(np.unique(orig_flags[orig_flags >= 0])) < 10:
+                    reason = "fewer than 10 distinct flag values"
+                elif not (0.025 < float(np.mean(orig_flags == 1)) < 0.085):
+                    reason = f"flag 1 covers {100 * float(np.mean(orig_flags == 1)):.1f}% of reflections"
+                elif np.any((orig_flags == 1) & free_v):
+                    reason = f"flag 1 overlaps the free set on {int(np.sum((orig_flags == 1) & free_v))} reflections"
+                else:
+                    val_v = (orig_flags == 1) & work_v
+                    train_v = work_v & (~val_v)
+                    return train_v, val_v
+            print(f"surfnturf: {data_mtz_path}: cannot take work_val from {free_flag_col} ({reason}); "
+                  f"using the hashed work_val split", file=sys.stderr)
+
+    if not np.any(work_v):
+        return np.zeros_like(work_v), np.zeros_like(work_v)
+    h19 = _hkl_hash_mod(keys, 19)
+    val_v = work_v & (h19 == 9)
+    if not np.any(val_v) and int(np.sum(work_v)) >= 2:
+        work_idx = np.nonzero(work_v)[0]
+        val_v[work_idx[int(np.argmin(_hkl_hash_mod(keys[work_idx], 2 ** 31)))]] = True
+    train_v = work_v & (~val_v)
+    if not np.any(train_v):
+        train_v = work_v.copy()
+        val_v = np.zeros(len(free_v), dtype=bool)
+    return train_v, val_v
+
+
+def resolution_scaled_bmob_hyperparams(d_min: float, fwhm_A='auto', lam_z='auto',
+                                       base_fwhm_A: float = 3.2, base_lam_z: float = 2e-4):
+    """Return resolution-scaled `(fwhm_eff, lam_z_eff)` preserving 3.2 A / 2e-4 at sub-angstrom d_min <= 1.0 A."""
+    d = max(float(d_min), 0.40)
+    if fwhm_A is None or (isinstance(fwhm_A, str) and fwhm_A.strip().lower() == 'auto'):
+        fwhm_eff = max(float(base_fwhm_A), round(3.5 * d, 2)) if d > 1.00 else float(base_fwhm_A)
+    else:
+        fwhm_eff = float(fwhm_A)
+    if lam_z is None or (isinstance(lam_z, str) and lam_z.strip().lower() == 'auto'):
+        lam_eff = float(base_lam_z) * max(1.0, (d / 0.965) ** 3)
+    else:
+        lam_eff = float(lam_z)
+    return fwhm_eff, lam_eff
+
+
+class ReciprocalTarget:
+    """Holds work/train/val/free reflections, fixed atomic F_calc, Phenix k_total, and bins for |Fo| fitting."""
+
+    def __init__(self, hkl, f_obs, work_mask, free_mask, f_calc, k_tot, bin_idx, n_bins, d_hkl,
+                 train_mask=None, val_mask=None, f_model_ref=None):
         self.hkl = np.ascontiguousarray(hkl, dtype=np.int64)
         self.f_obs = np.ascontiguousarray(f_obs, dtype=np.float64)
         self.work_mask = np.asarray(work_mask, dtype=bool)
         self.free_mask = np.asarray(free_mask, dtype=bool)
+        assert not np.any(self.work_mask & self.free_mask), "FREE SET LEAK IN WORK_MASK!"
         self.f_calc = np.ascontiguousarray(f_calc, dtype=np.complex128)
         self.k_tot = np.ascontiguousarray(k_tot, dtype=np.float64)
         self.bin_idx = np.ascontiguousarray(bin_idx, dtype=np.int32)
         self.n_bins = int(n_bins)
         self.d_hkl = np.ascontiguousarray(d_hkl, dtype=np.float64)
+        if train_mask is None or val_mask is None:
+            tr_m, vl_m = make_work_train_val_split(self.hkl, self.d_hkl, self.free_mask)
+            self.train_mask = tr_m & self.work_mask
+            self.val_mask = vl_m & (~self.free_mask)
+        else:
+            self.train_mask = np.asarray(train_mask, dtype=bool) & (~self.free_mask)
+            self.val_mask = np.asarray(val_mask, dtype=bool) & (~self.free_mask)
+        self.f_model_ref = np.asarray(f_model_ref) if f_model_ref is not None else None
         self.work_fo2_sum = float(np.sum(self.f_obs[self.work_mask] ** 2))
         self.work_fo_sum = float(np.sum(self.f_obs[self.work_mask]))
         self.free_fo_sum = float(np.sum(self.f_obs[self.free_mask]))
 
-    def eval_loss_grad_and_r(self, f_part, k_bounds=(0.0, 3.0)):
+    def for_training_subset(self) -> 'ReciprocalTarget':
+        """Return a ReciprocalTarget whose active `work_mask` is restricted to `train_mask` (90%), holding `val_mask` unseen."""
+        use_tr = self.train_mask if np.any(self.train_mask) else self.work_mask
+        return ReciprocalTarget(
+            hkl=self.hkl, f_obs=self.f_obs, work_mask=use_tr, free_mask=self.free_mask,
+            f_calc=self.f_calc, k_tot=self.k_tot, bin_idx=self.bin_idx, n_bins=self.n_bins,
+            d_hkl=self.d_hkl, train_mask=use_tr, val_mask=self.val_mask, f_model_ref=self.f_model_ref,
+        )
+
+    def eval_blind_rval(self, f_part, kmask_mode: str = 'per_bin', k_bounds=(0.0, 3.0)):
+        """Fit solvent scales strictly on `train_mask` and return `(r_train, r_val, r_work, r_free)`."""
+        tr = self.train_mask if np.any(self.train_mask) else self.work_mask
+        vl = self.val_mask
+        wk = self.work_mask | vl
+        fr = self.free_mask
+
+        if kmask_mode == 'fixed_one':
+            u_tot = self.k_tot * (self.f_calc + f_part)
+            au = np.abs(u_tot)
+            denom = float(np.sum(au[tr] ** 2))
+            k0 = float(np.sum(au[tr] * self.f_obs[tr]) / max(denom, 1e-12))
+            afm = np.abs(k0 * u_tot)
+        else:
+            _, k_hkl = fit_kmask_per_bin(
+                self.f_calc, f_part, self.k_tot, self.f_obs, tr,
+                self.bin_idx, self.n_bins, loss_type='l2', k_bounds=k_bounds
+            )
+            afm = np.abs(self.k_tot * (self.f_calc + k_hkl * f_part))
+
+        def _r(sel):
+            s = float(np.sum(self.f_obs[sel])) if np.any(sel) else 0.0
+            return float(np.sum(np.abs(afm[sel] - self.f_obs[sel])) / s) if s > 0.0 else float('nan')
+
+        return _r(tr), _r(vl), _r(wk), _r(fr)
+
+    def eval_fmodel_ref_rval(self) -> float:
+        """Evaluate the input `*_f_model.mtz` amplitude agreement on unseen `val_mask`."""
+        if self.f_model_ref is None or not np.any(self.val_mask):
+            return float('nan')
+        denom = float(np.sum(self.f_obs[self.val_mask]))
+        if denom <= 0.0:
+            return float('nan')
+        return float(np.sum(np.abs(np.abs(self.f_model_ref[self.val_mask]) - self.f_obs[self.val_mask])) / denom)
+
+    def eval_loss_grad_and_r(self, f_part, k_bounds=(0.0, 3.0), kmask_mode: str = 'per_bin'):
+        w = self.work_mask
+        fr = self.free_mask
+        inv_norm = 1.0 / max(self.work_fo2_sum, 1e-12)
+
+        if kmask_mode == 'fixed_one':
+            u_tot = self.k_tot * (self.f_calc + f_part)
+            au = np.abs(u_tot)
+            denom = float(np.sum(au[w] ** 2))
+            k0 = float(np.sum(au[w] * self.f_obs[w]) / max(denom, 1e-12))
+            fm = k0 * u_tot
+            afm = np.maximum(np.abs(fm), 1e-12)
+            res = afm - self.f_obs
+            loss = 0.5 * float(np.sum(res[w] ** 2)) * inv_norm
+            dL_dF = np.zeros_like(f_part, dtype=np.complex128)
+            dL_dF[w] = (res[w] * inv_norm) * (k0 * self.k_tot[w]) * (fm[w] / afm[w])
+            r_work = float(np.sum(np.abs(res[w])) / max(self.work_fo_sum, 1e-12))
+            r_free = float(np.sum(np.abs(res[fr])) / self.free_fo_sum) if np.any(fr) and self.free_fo_sum > 0 else float('nan')
+            return loss, dL_dF, r_work, r_free, np.full(self.n_bins, 1.0, dtype=np.float64)
+
         k_bins, k_hkl = fit_kmask_per_bin(
-            self.f_calc, f_part, self.k_tot, self.f_obs, self.work_mask,
+            self.f_calc, f_part, self.k_tot, self.f_obs, w,
             self.bin_idx, self.n_bins, loss_type='l2', k_bounds=k_bounds
         )
         fm = self.k_tot * (self.f_calc + k_hkl * f_part)
         afm = np.maximum(np.abs(fm), 1e-12)
         res = afm - self.f_obs
-
-        w = self.work_mask
-        fr = self.free_mask
-        inv_norm = 1.0 / max(self.work_fo2_sum, 1e-12)
         loss = 0.5 * float(np.sum(res[w] ** 2)) * inv_norm
-
         dL_dF = np.zeros_like(f_part, dtype=np.complex128)
         dL_dF[w] = (res[w] * inv_norm) * self.k_tot[w] * k_hkl[w] * (fm[w] / afm[w])
 
@@ -1051,6 +1191,7 @@ def multiB_fpart_loss_and_grad(
     clamp_nonneg=True,
     compute_grad=True,
     use_f32_blas=True,
+    kmask_mode='per_bin',
 ):
     """Evaluate reciprocal-space work-set loss, R_work/R_free, solv_3d, and exact analytical gradients."""
     grid = ds.grid
@@ -1083,7 +1224,7 @@ def multiB_fpart_loss_and_grad(
     rho_3d = grid.asu_to_full_3d(g_eff_asu) * RHO_BULK
     solv_3d = np.maximum(rho_3d, 0.0) if clamp_nonneg else rho_3d
     f_part = solv_to_fpart(solv_3d, grid.cell.volume, target.hkl)
-    loss, dL_dF, r_work, r_free, k_bins = target.eval_loss_grad_and_r(f_part)
+    loss, dL_dF, r_work, r_free, k_bins = target.eval_loss_grad_and_r(f_part, kmask_mode=kmask_mode)
 
     if not compute_grad:
         return {
@@ -1119,13 +1260,14 @@ def multiB_fpart_loss_and_grad(
     }
 
 
-def fit_uniform_B_on_work(renderer, target, ds, cached_pmf, displace_mode='none', keep_asu=None, maxiter=35):
+def fit_uniform_B_on_work(renderer, target, ds, cached_pmf, displace_mode='none', keep_asu=None,
+                          kmask_mode='per_bin', maxiter=35):
     """Fit 1 scalar uniform B_const on work |Fo| via L-BFGS-B."""
     def obj(x):
         z_arr = np.full((1, ds.grid.n_asu), float(x[0]), dtype=np.float64)
         out = multiB_fpart_loss_and_grad(
             renderer, target, ds, z_arr, cached_pmf=cached_pmf,
-            displace_mode=displace_mode, keep_asu=keep_asu, compute_grad=True
+            displace_mode=displace_mode, keep_asu=keep_asu, compute_grad=True, kmask_mode=kmask_mode
         )
         return out['loss'], np.array([float(np.sum(out['grad_z_raw_m']))], dtype=np.float64)
 
@@ -1142,14 +1284,15 @@ def fit_uniform_B_on_work(renderer, target, ds, cached_pmf, displace_mode='none'
     z_opt = float(res.x[0])
     out = multiB_fpart_loss_and_grad(
         renderer, target, ds, np.full((1, ds.grid.n_asu), z_opt), cached_pmf=cached_pmf,
-        displace_mode=displace_mode, keep_asu=keep_asu, compute_grad=False
+        displace_mode=displace_mode, keep_asu=keep_asu, compute_grad=False, kmask_mode=kmask_mode
     )
     out['B_const'] = float(np.exp(z_opt))
     return out
 
 
 def fit_physical_bmob_on_work(renderer, target, ds, mob_feat, cached_pmf,
-                              displace_mode='none', keep_asu=None, use_tb32_anchor=False, maxiter=65):
+                              displace_mode='none', keep_asu=None, use_tb32_anchor=False,
+                              kmask_mode='per_bin', maxiter=65):
     """Fit 6-parameter physical mobility model B_phys^(m)(x; psi) on work |Fo| (PMF frozen)."""
     phys_spec = PhysicalBMobSpec(use_tb32_anchor=use_tb32_anchor)
     inits = [
@@ -1161,7 +1304,7 @@ def fit_physical_bmob_on_work(renderer, target, ds, mob_feat, cached_pmf,
         z_p, _, pb_p = phys_spec.forward_with_pullback(mob_feat, psi)
         out = multiB_fpart_loss_and_grad(
             renderer, target, ds, z_p, cached_pmf=cached_pmf,
-            displace_mode=displace_mode, keep_asu=keep_asu, compute_grad=True
+            displace_mode=displace_mode, keep_asu=keep_asu, compute_grad=True, kmask_mode=kmask_mode
         )
         return out['loss'], pb_p(out['grad_z_raw_m'])
 
@@ -1172,7 +1315,7 @@ def fit_physical_bmob_on_work(renderer, target, ds, mob_feat, cached_pmf,
     z_opt, B_phys_opt, _ = phys_spec.forward_with_pullback(mob_feat, psi_opt)
     out = multiB_fpart_loss_and_grad(
         renderer, target, ds, z_opt, cached_pmf=cached_pmf,
-        displace_mode=displace_mode, keep_asu=keep_asu, compute_grad=False
+        displace_mode=displace_mode, keep_asu=keep_asu, compute_grad=False, kmask_mode=kmask_mode
     )
     out['psi'] = psi_opt
     out['phys_params'] = phys_spec.unpack_physical(psi_opt)
@@ -1181,18 +1324,20 @@ def fit_physical_bmob_on_work(renderer, target, ds, mob_feat, cached_pmf,
     return out
 
 
-def fit_spatial_bmob_on_work(renderer, target, ds, z_base_m, cached_pmf, fwhm_A=3.2, lam_z=2e-4,
-                             displace_mode='none', keep_asu=None, maxiter=75, eta_init=None):
+def fit_spatial_bmob_on_work(renderer, target, ds, z_base_m, cached_pmf, fwhm_A='auto', lam_z='auto',
+                             displace_mode='none', keep_asu=None, kmask_mode='per_bin', maxiter=75, eta_init=None):
     """Nudge spatial log-mobility field dz_asu = S_fwhm(eta_asu) on work |Fo| (PMF frozen)."""
     grid = ds.grid
-    smoother = SpatialSmoother3D(grid, fwhm_A=fwhm_A)
-    w_reg = float(lam_z) * (grid.orbit_mult / float(grid.nvox))
+    d_min_t = float(np.min(target.d_hkl)) if len(target.d_hkl) else 0.965
+    fwhm_eff, lam_eff = resolution_scaled_bmob_hyperparams(d_min_t, fwhm_A=fwhm_A, lam_z=lam_z)
+    smoother = SpatialSmoother3D(grid, fwhm_A=fwhm_eff)
+    w_reg = float(lam_eff) * (grid.orbit_mult / float(grid.nvox))
 
     def obj(eta):
         dz_asu = smoother.forward(eta)
         out = multiB_fpart_loss_and_grad(
             renderer, target, ds, z_base_m + dz_asu[None, :], cached_pmf=cached_pmf,
-            displace_mode=displace_mode, keep_asu=keep_asu, compute_grad=True
+            displace_mode=displace_mode, keep_asu=keep_asu, compute_grad=True, kmask_mode=kmask_mode
         )
         pen = 0.5 * float(np.sum(w_reg * (eta ** 2)))
         g_dz = np.sum(out['grad_z_raw_m'], axis=0)
@@ -1207,20 +1352,24 @@ def fit_spatial_bmob_on_work(renderer, target, ds, z_base_m, cached_pmf, fwhm_A=
     dz_opt = smoother.forward(eta_opt)
     out = multiB_fpart_loss_and_grad(
         renderer, target, ds, z_base_m + dz_opt[None, :], cached_pmf=cached_pmf,
-        displace_mode=displace_mode, keep_asu=keep_asu, compute_grad=False
+        displace_mode=displace_mode, keep_asu=keep_asu, compute_grad=False, kmask_mode=kmask_mode
     )
     out['eta_asu'] = eta_opt
     out['dz_asu'] = dz_opt
+    out['fwhm_A'] = fwhm_eff
+    out['lam_z'] = lam_eff
     return out
 
 
 def fit_joint_pmf_and_bmob_on_work(renderer, target, ds, spec, theta_init, mob_feat, psi_init,
-                                   eta_init=None, fwhm_A=3.2, lam_z=2e-4, lam_md=2e-5,
-                                   displace_mode='none', keep_asu=None, maxiter=45):
-    """Two-block well-conditioned optimization of (theta_PMF, psi_phys) + 3.2A spatial dz_asu on work |Fo|."""
+                                   eta_init=None, fwhm_A='auto', lam_z='auto', lam_md=2e-5,
+                                   displace_mode='none', keep_asu=None, kmask_mode='per_bin', maxiter=45):
+    """Two-block well-conditioned optimization of (theta_PMF, psi_phys) + res-scaled spatial dz_asu on work |Fo|."""
     grid = ds.grid
+    d_min_t = float(np.min(target.d_hkl)) if len(target.d_hkl) else 0.965
+    fwhm_eff, lam_eff = resolution_scaled_bmob_hyperparams(d_min_t, fwhm_A=fwhm_A, lam_z=lam_z)
     phys_spec = PhysicalBMobSpec()
-    smoother = SpatialSmoother3D(grid, fwhm_A=fwhm_A)
+    smoother = SpatialSmoother3D(grid, fwhm_A=fwhm_eff)
     dz_fixed = smoother.forward(eta_init) if eta_init is not None else np.zeros(grid.n_asu, dtype=np.float64)
 
     n_th = spec.n_params
@@ -1233,7 +1382,7 @@ def fit_joint_pmf_and_bmob_on_work(renderer, target, ds, spec, theta_init, mob_f
         z_p, _, pb_p = phys_spec.forward_with_pullback(mob_feat, ps)
         out = multiB_fpart_loss_and_grad(
             renderer, target, ds, z_p + dz_fixed[None, :], spec=spec, theta=th,
-            displace_mode=displace_mode, keep_asu=keep_asu, compute_grad=True
+            displace_mode=displace_mode, keep_asu=keep_asu, compute_grad=True, kmask_mode=kmask_mode
         )
         pen_sm, g_sm = smoothness_penalty_and_grad(spec, th, lam_pmf=8e-5, lam_hpol=8e-5, lam_oz=3e-5)
         diff_th = th - theta_init
@@ -1253,13 +1402,66 @@ def fit_joint_pmf_and_bmob_on_work(renderer, target, ds, spec, theta_init, mob_f
 
     sp_maxiter = max(2, int(maxiter))
     out = fit_spatial_bmob_on_work(
-        renderer, target, ds, z_p_opt, cached_new, fwhm_A=fwhm_A, lam_z=lam_z,
-        displace_mode=displace_mode, keep_asu=keep_asu, maxiter=sp_maxiter, eta_init=eta_init
+        renderer, target, ds, z_p_opt, cached_new, fwhm_A=fwhm_eff, lam_z=lam_eff,
+        displace_mode=displace_mode, keep_asu=keep_asu, kmask_mode=kmask_mode, maxiter=sp_maxiter, eta_init=eta_init
     )
     out['theta'] = th_opt
     out['psi'] = ps_opt
     out['phys_params'] = phys_spec.unpack_physical(ps_opt)
     return out
+
+
+def fit_bmob_blind_gated(renderer, target: ReciprocalTarget, ds, mob_feat, cached_pmf,
+                         displace_mode='none', keep_asu=None, kmask_mode='fixed_one',
+                         fwhm_A='auto', lam_z='auto', maxiter=55, min_rval_gain: float = 1e-4):
+    """Fit uniform, 6-param physical, and res-scaled spatial B(x) strictly on 90% `train_mask` and pick the blind `val_mask` winner.
+
+    Keeping `target.val_mask` (5%) strictly unseen prevents spatial B(x) overfitting at low resolution
+    and preserves `val_mask` uncontaminated for any downstream `fit-divot` stage, without ever touching `FreeR_flag == 0`.
+    """
+    targ_tr = target.for_training_subset()
+    z_b5 = np.full((1, ds.grid.n_asu), np.log(5.0), dtype=np.float64)
+    out_0 = multiB_fpart_loss_and_grad(
+        renderer, targ_tr, ds, z_b5, cached_pmf=cached_pmf,
+        displace_mode=displace_mode, keep_asu=keep_asu, compute_grad=False, kmask_mode=kmask_mode,
+    )
+    out_u = fit_uniform_B_on_work(
+        renderer, targ_tr, ds, cached_pmf, displace_mode=displace_mode, keep_asu=keep_asu,
+        kmask_mode=kmask_mode, maxiter=maxiter,
+    )
+    out_p = fit_physical_bmob_on_work(
+        renderer, targ_tr, ds, mob_feat, cached_pmf, displace_mode=displace_mode, keep_asu=keep_asu,
+        kmask_mode=kmask_mode, maxiter=maxiter,
+    )
+    out_s = fit_spatial_bmob_on_work(
+        renderer, targ_tr, ds, out_p['z_phys'], cached_pmf, fwhm_A=fwhm_A, lam_z=lam_z,
+        displace_mode=displace_mode, keep_asu=keep_asu, kmask_mode=kmask_mode, maxiter=maxiter,
+    )
+
+    stages = [('0shot', out_0), ('uniform', out_u), ('phys', out_p), ('spatial', out_s)]
+    rval_table = {}
+    best_name, best_out = stages[0]
+    best_rv = float('inf')
+
+    for s_name, s_out in stages:
+        # Score each stage with the same k_mask model it was fitted with (a per-bin refit of a k_mask = 1 fit
+        # re-opens the B / k_mask trade-off that fixed_one removes, and ranks a model nobody fitted)
+        r_tr, r_vl, r_wk, r_fr = target.eval_blind_rval(s_out['f_part'], kmask_mode=kmask_mode)
+        score = r_vl if np.isfinite(r_vl) else r_tr
+        rval_table[s_name] = round(float(score), 6)
+        s_out['r_train'] = r_tr
+        s_out['r_val'] = r_vl
+        s_out['r_work'] = r_wk
+        s_out['r_free'] = r_fr
+        if score < best_rv - (0.0 if s_name == '0shot' else float(min_rval_gain)):
+            best_rv = score
+            best_name = s_name
+            best_out = s_out
+
+    best_out['selected_stage'] = best_name
+    best_out['r_val_table'] = rval_table
+    best_out['r_val_fmodel_ref'] = target.eval_fmodel_ref_rval()
+    return best_out
 
 
 def summarize_bmob_microenvironments(label, B_eff_asu, mob_feat, mw):
@@ -1305,7 +1507,9 @@ def _norm_col_label(s: str) -> str:
     return s.upper().replace('-', '').replace('_', '')
 
 
-def load_reciprocal_target_from_fmodel_mtz(fmodel_mtz_path: str, n_bins: int = 24):
+def load_reciprocal_target_from_fmodel_mtz(fmodel_mtz_path: str, n_bins: int = 24,
+                                           data_mtz_path: str = None, free_flag_col: str = 'FreeR_flag',
+                                           free_flag_value=None):
     """Build a ReciprocalTarget directly from a Phenix `*_f_model.mtz` file (`export_final_f_model=True`)."""
     mtz = gemmi.read_mtz_file(fmodel_mtz_path)
     if not mtz.cell.is_crystal():
@@ -1333,11 +1537,7 @@ def load_reciprocal_target_from_fmodel_mtz(fmodel_mtz_path: str, n_bins: int = 2
     valid = np.isfinite(f_obs) & (f_obs > 0.0) & np.isfinite(flags)
     if int(np.sum(valid)) < 2:
         raise ValueError(f"{fmodel_mtz_path}: fewer than 2 valid positive reflections found")
-    uflags = set(np.unique(flags[valid]).astype(int).tolist())
-    if uflags.issubset({0, 1}) and np.mean(flags[valid] == 1) < 0.25:
-        free_raw = (flags == 1)
-    else:
-        free_raw = (flags == 0)
+    free_raw = free_mask_from_flags(flags, valid, free_flag_value, source_desc=fmodel_mtz_path)
 
     work_mask = valid & (~free_raw)
     free_mask = valid & free_raw
@@ -1403,10 +1603,15 @@ def load_reciprocal_target_from_fmodel_mtz(fmodel_mtz_path: str, n_bins: int = 2
         else gemmi.SpaceGroup("P 1")
     ) or sg_raw or gemmi.SpaceGroup("P 1")
 
+    train_v, val_v = make_work_train_val_split(
+        hkl[valid], d_hkl[valid], free_mask[valid],
+        data_mtz_path=data_mtz_path, free_flag_col=free_flag_col, spacegroup=sg,
+    )
     target = ReciprocalTarget(
         hkl=hkl[valid], f_obs=f_obs[valid],
         work_mask=work_mask[valid], free_mask=free_mask[valid],
         f_calc=f_calc[valid], k_tot=k_tot[valid],
-        bin_idx=bin_idx[valid], n_bins=int(n_bins), d_hkl=d_hkl[valid]
+        bin_idx=bin_idx[valid], n_bins=int(n_bins), d_hkl=d_hkl[valid],
+        train_mask=train_v, val_mask=val_v, f_model_ref=f_model[valid],
     )
     return target, mtz.cell, sg

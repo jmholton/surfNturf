@@ -192,6 +192,29 @@ class TestSurfNTurfBMob(unittest.TestCase):
                                                fwhm_A=3.2, displace_mode="pre", keep_asu=keep_pre, maxiter=2)
         self.assertTrue(np.isfinite(u_out["loss"]) and np.isfinite(s3_out["loss"]) and np.isfinite(j_out["loss"]))
 
+        # Verify v0.2 fixed_one (k_mask == 1.000) reciprocal gradient & v0.2 TetOZ4+PauliCap SlimDatasetBundle parity
+        res_k1 = multiB_fpart_loss_and_grad(
+            renderer, target, ds_slim, z_tot0, cached_pmf=cached,
+            displace_mode="none", compute_grad=True, kmask_mode="fixed_one"
+        )
+        self.assertTrue(np.all(res_k1["k_bins"] == 1.0))
+        g_eta_k1 = smoother.adjoint(np.sum(res_k1["grad_z_raw_m"], axis=0))
+        lp_k1 = multiB_fpart_loss_and_grad(
+            renderer, target, ds_slim, z_tot0 + (eps * dz_dir)[None, :], cached_pmf=cached,
+            displace_mode="none", compute_grad=False, kmask_mode="fixed_one"
+        )["loss"]
+        lm_k1 = multiB_fpart_loss_and_grad(
+            renderer, target, ds_slim, z_tot0 - (eps * dz_dir)[None, :], cached_pmf=cached,
+            displace_mode="none", compute_grad=False, kmask_mode="fixed_one"
+        )["loss"]
+        fd_k1 = (lp_k1 - lm_k1) / (2.0 * eps)
+        ana_k1 = float(np.dot(g_eta_k1, d_eta))
+        self.assertLess(abs(ana_k1 - fd_k1) / max(abs(ana_k1), abs(fd_k1), 1e-9), 2e-4)
+        s_k1_out = fit_spatial_bmob_on_work(
+            renderer, target, ds_slim, p_out["z_phys"], cached, fwhm_A=3.2, kmask_mode="fixed_one", maxiter=2
+        )
+        self.assertTrue(np.isfinite(s_k1_out["loss"]))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -23,15 +23,37 @@ from .io import (
 from .reconnect import reconnect_pdb_to_conformers, write_member_pdbs
 
 _ALLOWED_PREDICT_KEYS = {
-    "weights", "B", "grid", "alt", "nconf", "mode", "dmin", "hkl", "bmob", "displace", "ignore_waters", "shape"
+    "weights", "B", "grid", "alt", "nconf", "mode", "dmin", "hkl",
+    "bmob", "displace", "ignore_waters", "shape", "complete_h",
 }
 
 
 def _nyquist_safe_grid_spacing(gsp: float, d_hi: float) -> float:
     """Ensure 2 * grid_spacing < d_hi so all reflections up to d_hi sit strictly inside the FFT Nyquist box."""
     if math.isfinite(d_hi) and d_hi > 0.0 and 2.05 * gsp > d_hi:
-        return max(0.15, round(d_hi / 2.12, 4))
+        return max(0.15, round(d_hi / 2.18, 4))
     return gsp
+
+
+def _choose_nyquist_safe_shape(cell: gemmi.UnitCell, sg: gemmi.SpaceGroup, gsp: float, d_hi: float, hkl_arr=None):
+    """Choose symmetry-compatible grid shape guaranteed to enclose every Miller index in `hkl_arr` inside Nyquist."""
+    cur_gsp = _nyquist_safe_grid_spacing(float(gsp), float(d_hi))
+    shape = choose_sg_grid_shape(cell, sg, cur_gsp)
+    if hkl_arr is None or len(hkl_arr) == 0:
+        return shape, cur_gsp
+    H = np.asarray(hkl_arr, dtype=np.int64)
+    for _ in range(6):
+        nu, nv, nw = shape
+        in_nyq = (
+            (H[:, 0] >= -(nu // 2)) & (H[:, 0] <= (nu - 1) // 2) &
+            (H[:, 1] >= -(nv // 2)) & (H[:, 1] <= (nv - 1) // 2) &
+            (H[:, 2] >= -(nw // 2)) & (H[:, 2] <= (nw - 1) // 2)
+        )
+        if np.all(in_nyq):
+            break
+        cur_gsp = max(0.12, round(cur_gsp * 0.90, 4))
+        shape = choose_sg_grid_shape(cell, sg, cur_gsp)
+    return shape, cur_gsp
 
 
 def _split_dataset_spec(spec_str: str):
@@ -89,11 +111,22 @@ def _cmd_predict(args):
         displace = "0"
     shape_str = kv.get("shape", args.shape)
     exact_shape = tuple(int(x) for x in shape_str.split(",")) if shape_str else None
+    complete_h = (not args.no_complete_h) and (kv.get("complete_h", "1").lower() not in ("0", "false", "no"))
     if exact_shape is None:
         if hkl_mtz and os.path.isfile(hkl_mtz):
             ref_m = gemmi.read_mtz_file(hkl_mtz)
             ref_m.update_reso()
-            gsp = _nyquist_safe_grid_spacing(gsp, float(ref_m.resolution_high()))
+            st_tmp = (
+                gemmi.read_structure(sorted(os.path.join(args.target, f) for f in os.listdir(args.target) if f.endswith(".pdb"))[0])
+                if os.path.isdir(args.target) else gemmi.read_structure(args.target)
+            )
+            if st_tmp.cell.is_crystal():
+                c_tmp, sg_tmp = resolve_crystal_symmetry(st_tmp.cell, st_tmp.spacegroup_hm, source_desc=str(args.target))
+                exact_shape, gsp = _choose_nyquist_safe_shape(
+                    c_tmp, sg_tmp, gsp, float(ref_m.resolution_high()), ref_m.make_miller_array()
+                )
+            else:
+                gsp = _nyquist_safe_grid_spacing(gsp, float(ref_m.resolution_high()))
         elif str(dmin).lower() != "none":
             gsp = _nyquist_safe_grid_spacing(gsp, float(dmin))
 
@@ -107,6 +140,7 @@ def _cmd_predict(args):
         nconf=nconf,
         mode=mode,
         bmob_preset=bmob_preset,
+        complete_h=complete_h,
     )
     out = args.out_prefix
     out_dir = os.path.dirname(os.path.abspath(out))
@@ -186,29 +220,52 @@ def _cmd_fit_bmob(args):
         fit_physical_bmob_on_work,
         fit_spatial_bmob_on_work,
         fit_joint_pmf_and_bmob_on_work,
+        fit_bmob_blind_gated,
         summarize_bmob_microenvironments,
         load_reciprocal_target_from_fmodel_mtz,
     )
 
     spec, theta = load_saved_spec_and_theta(args.weights)
-    target, cell, sg = load_reciprocal_target_from_fmodel_mtz(args.fmodel_mtz, n_bins=args.bins)
+    data_mtz_ref = args.data_mtz or args.hkl
+    target_full, cell, sg = load_reciprocal_target_from_fmodel_mtz(
+        args.fmodel_mtz, n_bins=args.bins, data_mtz_path=data_mtz_ref, free_flag_value=args.free_flag_value
+    )
     if args.shape:
         shape = tuple(int(x) for x in args.shape.split(","))
     else:
-        d_hi = float(np.min(target.d_hkl))
+        d_hi = float(np.min(target_full.d_hkl))
+        hkl_check = target_full.hkl
         if args.hkl and os.path.isfile(args.hkl):
             rm = gemmi.read_mtz_file(args.hkl)
             rm.update_reso()
             d_hi = min(d_hi, float(rm.resolution_high()))
-        gsp = _nyquist_safe_grid_spacing(float(args.grid), d_hi)
-        shape = choose_sg_grid_shape(cell, sg, gsp)
+            hkl_check = np.vstack([hkl_check, np.asarray(rm.make_miller_array(), dtype=np.int64)])
+        shape, gsp = _choose_nyquist_safe_shape(cell, sg, float(args.grid), d_hi, hkl_check)
 
     grid = ASUGrid(cell, sg, shape, step=1)
-    members, bisos, wts = load_ensemble_with_bfac(args.pdb, nconf=args.nconf, two_type_heavy_only=(spec.n_types == 2))
-    Phi_O, Phi_H, steric_H, mob_feat = fast_build_asu_and_mobility(
-        grid, members, bisos, n_types=spec.n_types, include_hpol=spec.use_hpol
+    two_type = (spec.n_types == 2)
+    complete_h = not args.no_complete_h
+    if spec.use_epol:
+        members, bisos, wts, charges = load_ensemble_with_bfac(
+            args.pdb, nconf=args.nconf, two_type_heavy_only=two_type,
+            use_lp=spec.use_lp, return_charges=True, complete_h=complete_h,
+        )
+    else:
+        members, bisos, wts = load_ensemble_with_bfac(
+            args.pdb, nconf=args.nconf, two_type_heavy_only=two_type,
+            use_lp=spec.use_lp, complete_h=complete_h,
+        )
+        charges = None
+
+    Phi_O, Phi_H, steric_H, mob_feat, extra = fast_build_asu_and_mobility(
+        grid, members, bisos, n_types=spec.n_types, include_hpol=spec.use_hpol,
+        include_tet_oz=spec.use_tet_oz, include_epol=spec.use_epol,
+        charges=charges, member_weights=wts, return_extra=True,
     )
-    ds_slim = SlimDatasetBundle("bmob", grid, B_map=5.0, Phi_O=Phi_O, Phi_H=Phi_H, steric_H=steric_H, member_weights=wts)
+    ds_slim = SlimDatasetBundle(
+        "bmob", grid, B_map=5.0, Phi_O=Phi_O, Phi_H=Phi_H, steric_H=steric_H,
+        member_weights=wts, F_hbsol=extra["F_hbsol"], E_feats=extra["E_feats"],
+    )
     mob_asu = reduce_mobility_features_to_asu(mob_feat, wts)
     renderer = MultiBRenderer(grid)
     gO_m, gH_m, sk, _ = compute_pmf_density_with_pullback(spec, ds_slim, theta, need_grad=False)
@@ -227,32 +284,60 @@ def _cmd_fit_bmob(args):
         )
         keep_asu, _ = build_water_keep_mask_asu(grid, g_hat_init, wx, wo)
 
-    if args.mode == "uniform":
-        out = fit_uniform_B_on_work(
-            renderer, target, ds_slim, cached, displace_mode=disp_mode, keep_asu=keep_asu, maxiter=args.maxiter
+    km_mode = args.kmask_mode
+    if km_mode == "auto":
+        km_mode = "per_bin" if args.mode == "joint" else "fixed_one"
+
+    fwhm_arg = "auto" if str(args.fwhm).strip().lower() == "auto" else float(args.fwhm)
+    lam_arg = "auto" if str(args.lam_z).strip().lower() == "auto" else float(args.lam_z)
+    targ_fit = target_full if args.no_holdout_val else target_full.for_training_subset()
+
+    if args.mode == "auto":
+        out = fit_bmob_blind_gated(
+            renderer, target_full, ds_slim, mob_asu, cached,
+            displace_mode=disp_mode, keep_asu=keep_asu, kmask_mode=km_mode,
+            fwhm_A=fwhm_arg, lam_z=lam_arg, maxiter=args.maxiter,
         )
+        mode_desc = f"auto->{out['selected_stage']}"
+    elif args.mode == "uniform":
+        out = fit_uniform_B_on_work(
+            renderer, targ_fit, ds_slim, cached, displace_mode=disp_mode, keep_asu=keep_asu,
+            kmask_mode=km_mode, maxiter=args.maxiter,
+        )
+        mode_desc = "uniform"
     elif args.mode == "phys":
         out = fit_physical_bmob_on_work(
-            renderer, target, ds_slim, mob_asu, cached, displace_mode=disp_mode, keep_asu=keep_asu, maxiter=args.maxiter
+            renderer, targ_fit, ds_slim, mob_asu, cached, displace_mode=disp_mode, keep_asu=keep_asu,
+            kmask_mode=km_mode, maxiter=args.maxiter,
         )
+        mode_desc = "phys"
     elif args.mode == "tb32":
         p_out = fit_physical_bmob_on_work(
-            renderer, target, ds_slim, mob_asu, cached, displace_mode=disp_mode, keep_asu=keep_asu, maxiter=args.maxiter
+            renderer, targ_fit, ds_slim, mob_asu, cached, displace_mode=disp_mode, keep_asu=keep_asu,
+            kmask_mode=km_mode, maxiter=args.maxiter,
         )
         out = fit_spatial_bmob_on_work(
-            renderer, target, ds_slim, p_out["z_phys"], cached, fwhm_A=args.fwhm, lam_z=args.lam_z,
-            displace_mode=disp_mode, keep_asu=keep_asu, maxiter=args.maxiter
+            renderer, targ_fit, ds_slim, p_out["z_phys"], cached, fwhm_A=fwhm_arg, lam_z=lam_arg,
+            displace_mode=disp_mode, keep_asu=keep_asu, kmask_mode=km_mode, maxiter=args.maxiter,
         )
+        mode_desc = f"tb32(fwhm={out['fwhm_A']:.2f}A)"
     else:
         p_out = fit_physical_bmob_on_work(
-            renderer, target, ds_slim, mob_asu, cached, displace_mode=disp_mode, keep_asu=keep_asu, maxiter=args.maxiter
+            renderer, targ_fit, ds_slim, mob_asu, cached, displace_mode=disp_mode, keep_asu=keep_asu,
+            kmask_mode="fixed_one", maxiter=args.maxiter,
         )
         out = fit_joint_pmf_and_bmob_on_work(
-            renderer, target, ds_slim, spec, theta, mob_asu, p_out["psi"], fwhm_A=args.fwhm, lam_z=args.lam_z,
-            displace_mode=disp_mode, keep_asu=keep_asu, maxiter=args.maxiter
+            renderer, targ_fit, ds_slim, spec, theta, mob_asu, p_out["psi"], fwhm_A=fwhm_arg, lam_z=lam_arg,
+            displace_mode=disp_mode, keep_asu=keep_asu, kmask_mode=km_mode, maxiter=args.maxiter,
         )
+        mode_desc = f"joint(fwhm={out['fwhm_A']:.2f}A)"
 
-    summarize_bmob_microenvironments(args.mode, out["B_eff_asu"], mob_asu, wts)
+    if "r_val" not in out:
+        r_tr, r_vl, r_wk, r_fr = target_full.eval_blind_rval(out["f_part"], kmask_mode=km_mode)
+        out["r_train"], out["r_val"], out["r_work"], out["r_free"] = r_tr, r_vl, r_wk, r_fr
+        out["r_val_fmodel_ref"] = target_full.eval_fmodel_ref_rval()
+
+    summarize_bmob_microenvironments(mode_desc, out["B_eff_asu"], mob_asu, wts)
     solv_3d = out["solv_3d"]
     out_dir = os.path.dirname(os.path.abspath(args.out))
     if out_dir:
@@ -260,10 +345,21 @@ def _cmd_fit_bmob(args):
     write_ccp4(f"{args.out}_solvent.ccp4", solv_3d, cell, sg)
     ref_mtz = args.hkl or args.fmodel_mtz
     write_fpart_mtz_on_hkl(solv_3d, cell, ref_mtz, f"{args.out}_fpart.mtz")
+
+    rv_str = f", blind r_val={100.0 * out['r_val']:.2f}%" if math.isfinite(out.get("r_val", float("nan"))) else ""
+    rv_ref = out.get("r_val_fmodel_ref", float("nan"))
+    if math.isfinite(rv_ref):
+        rv_str += f" (input fmodel r_val={100.0 * rv_ref:.2f}%)"
     print(
-        f"fit-bmob ({args.mode}, displace={disp_mode}): internal R_work / R_free = "
-        f"{100.0 * out['r_work']:.2f}% / {100.0 * out['r_free']:.2f}% -> wrote {args.out}_solvent.ccp4, {args.out}_fpart.mtz"
+        f"fit-bmob ({mode_desc}, kmask={km_mode}, displace={disp_mode}): internal R_work / R_free = "
+        f"{100.0 * out['r_work']:.2f}% / {100.0 * out['r_free']:.2f}%{rv_str} -> wrote {args.out}_solvent.ccp4, {args.out}_fpart.mtz"
     )
+    if math.isfinite(rv_ref) and math.isfinite(out.get("r_val", float("nan"))) and rv_ref < out["r_val"] - 0.002:
+        print(
+            f"surfnturf note: input fmodel mask has lower blind r_val ({100.0 * rv_ref:.2f}% vs "
+            f"{100.0 * out['r_val']:.2f}%); consider retaining the input continuum mask for this dataset.",
+            file=sys.stderr,
+        )
 
 
 def _cmd_fit_divot(args):
@@ -296,7 +392,8 @@ def _cmd_fit_divot(args):
     else:
         gsp = _nyquist_safe_grid_spacing(float(args.grid), d_hi)
         cell, sg, grid, _, _, _, solv_3d = predict_maps_for_target(
-            args.pdb, weights=args.weights, grid_spacing=gsp, nconf=args.nconf
+            args.pdb, weights=args.weights, grid_spacing=gsp, nconf=args.nconf,
+            complete_h=not args.no_complete_h,
         )
         wx, wo = extract_ordered_waters(args.pdb)
         if len(wx) > 0 and not args.ignore_waters:
@@ -305,8 +402,10 @@ def _cmd_fit_divot(args):
             base_3d = solv_3d
 
     cgrid = CrystalGridOps(cell, sg, base_3d.shape, conv="plus", fft_workers=args.workers)
-    prob = extract_problem_from_fmodel(cgrid, args.fmodel_mtz, data_mtz_path=args.data_mtz)
+    prob = extract_problem_from_fmodel(cgrid, args.fmodel_mtz, data_mtz_path=args.data_mtz,
+                                       free_flag_value=args.free_flag_value)
     open_mask = build_open_solvent_envelope(cgrid, args.pdb)
+    gate_val = not args.no_val_gate
 
     arm = args.arm.lower()
     if arm == "sw6_mc":
@@ -323,15 +422,18 @@ def _cmd_fit_divot(args):
         rho_opt, _, info = fit_periodic_arm(prob, pf)
     elif arm == "peak":
         rho_opt, info = fit_adaptive_divot_peak_blind(
-            prob, cgrid, base_3d, open_mask, fitreso_s=10.0, use_divots=False, use_peaks=True, n_passes=2
+            prob, cgrid, base_3d, open_mask, fitreso_s=10.0,
+            use_divots=False, use_peaks=True, n_passes=2, gate_on_val=gate_val,
         )
     elif arm == "divot":
         rho_opt, info = fit_adaptive_divot_peak_blind(
-            prob, cgrid, base_3d, open_mask, fitreso_s=10.0, use_divots=True, use_peaks=False, n_passes=1
+            prob, cgrid, base_3d, open_mask, fitreso_s=10.0,
+            use_divots=True, use_peaks=False, n_passes=1, gate_on_val=gate_val,
         )
     else:
         rho_opt, info = fit_adaptive_divot_peak_blind(
-            prob, cgrid, base_3d, open_mask, fitreso_s=8.0, use_divots=True, use_peaks=True, n_passes=2
+            prob, cgrid, base_3d, open_mask, fitreso_s=8.0,
+            use_divots=True, use_peaks=True, n_passes=2, gate_on_val=gate_val,
         )
 
     rho_scaled, ev = prob.scaled_solvent_rho(rho_opt, active_mask=prob.work)
@@ -341,11 +443,18 @@ def _cmd_fit_divot(args):
     write_ccp4(f"{args.out}_solvent.ccp4", rho_scaled, cell, sg)
     ref_mtz = args.data_mtz or args.fmodel_mtz
     write_fpart_cgrid(cgrid, rho_scaled, ref_mtz, f"{args.out}_fpart.mtz", col_names=("FPART", "PHIPART"))
+    sel_st = info.get("selected_stage", arm)
     print(
-        f"fit-divot (arm={arm}): internal R_work / R_free = {100.0 * ev['r_work']:.2f}% / {100.0 * ev['r_free']:.2f}% "
+        f"fit-divot (arm={arm}, stage={sel_st}): internal R_work / R_free = {100.0 * ev['r_work']:.2f}% / {100.0 * ev['r_free']:.2f}% "
         f"(blind r_val={100.0 * info.get('r_val', 0.0):.2f}%, k_solv/k_prot={ev['p'][1] / max(ev['p'][0], 1e-8):.3f}) "
         f"-> wrote {args.out}_solvent.ccp4, {args.out}_fpart.mtz"
     )
+    if ev['p'][1] <= prob.K_SOLV_MIN + 1e-6:
+        print(
+            f"surfnturf warning: k_solv ended at its floor ({prob.K_SOLV_MIN}): the work data reject this solvent map "
+            f"at any positive scale, so the written FPART is nearly empty. Check the base map, symmetry and cell.",
+            file=sys.stderr,
+        )
 
 
 def _cmd_train(args):
@@ -372,13 +481,24 @@ def _cmd_train(args):
         raise SystemExit("Provide at least one --dataset or --manifest.")
 
     res = fit_surfnturf_model(
-        datasets, loss_mode=args.loss, n_types=args.n_types, step=args.step,
-        nconf=args.nconf, maxiter=args.maxiter, out_npz=args.out
+        datasets,
+        loss_mode=args.loss,
+        n_types=args.n_types,
+        use_lp=not args.no_lp,
+        use_tet_oz=not args.no_tet_oz,
+        n_oz_steps=args.oz_steps,
+        use_epol=bool(args.epol),
+        use_pauli_cap=not args.no_pauli_cap,
+        zero_bulk_offset=not args.no_zero_bulk,
+        step=args.step,
+        nconf=args.nconf,
+        maxiter=args.maxiter,
+        out_npz=args.out,
     )
     written = res.get("out_npz") or args.out
     print(
-        f"Trained surfNturf ({args.loss}, {len(datasets)} datasets, {res['nit']} L-BFGS-B iters in {res['dt_s']}s): "
-        f"loss={res['loss']:.6f} -> wrote {written}"
+        f"Trained surfNturf ({args.loss}, {len(datasets)} datasets, {res['spec'].n_params} params, "
+        f"{res['nit']} L-BFGS-B iters in {res['dt_s']}s): loss={res['loss']:.6f} -> wrote {written}"
     )
 
 
@@ -407,7 +527,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("target", help="Input PDB/mmCIF file or directory of conformer member PDBs.")
     sp.add_argument("out_prefix", help="Output file prefix.")
     sp.add_argument("extra", nargs="*", help="Optional key=value overrides (e.g. B=5.0 hkl=refme.mtz).")
-    sp.add_argument("--weights", default="l2", help="Pretrained weights ('l2', 'kl', or path to .npz; default: l2).")
+    sp.add_argument("--weights", default="l2", help="Pretrained weights ('l2', 'kl', 'v1_l2', 'v1_kl', or .npz; default: l2).")
     sp.add_argument("--B", type=float, default=5.0, help="Isotropic water B-factor in A^2 when --bmob is not set (default: 5.0).")
     sp.add_argument("--bmob", default=None, help="Optional 0-shot physical 3D mobility preset ('dry_a4' or 'wet_b5b').")
     sp.add_argument("--grid", type=float, default=0.45, help="Target grid spacing in Angstroms (default: 0.45).")
@@ -419,6 +539,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--dmin", default="0.965", help="Resolution limit in A for standalone FPART MTZ when --hkl is omitted ('none' to skip).")
     sp.add_argument("--displace", default="auto", choices=["auto", "0", "1"], help="Displace ordered HOH atoms ('auto', '0', '1').")
     sp.add_argument("--ignore-waters", action="store_true", help="Ignore ordered HOH atoms in input PDB (DRY prediction).")
+    sp.add_argument("--no-complete-h", action="store_true", help="Disable automatic riding-hydrogen completion on H-less/partial-H PDBs.")
     sp.set_defaults(func=_cmd_predict)
 
     # 2. reconnect
@@ -433,21 +554,29 @@ def build_parser() -> argparse.ArgumentParser:
     su.set_defaults(func=_cmd_reconnect)
 
     # 3. fit-bmob
-    sb = sub.add_parser("fit-bmob", help="Fit spatially varying 3D water mobility B(x) against work-set |Fo|.")
+    sb = sub.add_parser("fit-bmob", help="Fit spatially varying 3D water mobility B(x) against 90%% work_train |Fo| with 5%% work_val gating.")
     sb.add_argument("--pdb", required=True, help="Input macromolecular model PDB/mmCIF or member directory.")
     sb.add_argument("--fmodel-mtz", required=True, help="Phenix *_f_model.mtz (from export_final_f_model=True).")
     sb.add_argument("--out", required=True, help="Output prefix for _solvent.ccp4 and _fpart.mtz.")
     sb.add_argument("--hkl", default=None, help="Optional reference MTZ for output HKL list (defaults to --fmodel-mtz).")
-    sb.add_argument("--weights", default="l2", help="Starting surfNturf weights ('l2', 'kl', or .npz).")
-    sb.add_argument("--mode", default="joint", choices=["uniform", "phys", "tb32", "joint"], help="Mobility fit mode.")
-    sb.add_argument("--fwhm", type=float, default=3.2, help="Spatial coupling FWHM in A (default: 3.2).")
-    sb.add_argument("--lam-z", type=float, default=2e-4, help="L2 regularization on spatial ln B nudges (default: 2e-4).")
+    sb.add_argument("--data-mtz", default=None, help="Optional diffraction MTZ with 20-bin FreeR_flag for shared 90/5/5 split.")
+    sb.add_argument("--free-flag-value", type=int, default=None,
+                    help="R-free flag value marking the test set (default: minority value of 0/1 flags, else 0).")
+    sb.add_argument("--weights", default="l2", help="Starting surfNturf weights ('l2', 'kl', 'v1_l2', 'v1_kl', or .npz).")
+    sb.add_argument("--mode", default="auto", choices=["auto", "uniform", "phys", "tb32", "joint"],
+                    help="Mobility fit mode ('auto' gates 0shot/uniform/phys/spatial on unseen 5%% work_val; default: auto).")
+    sb.add_argument("--kmask-mode", default="auto", choices=["auto", "fixed_one", "per_bin"],
+                    help="Reciprocal k_mask ruler ('auto' uses strict k_mask=1 for auto/uniform/phys/tb32 and per_bin for joint).")
+    sb.add_argument("--fwhm", default="auto", help="Spatial coupling FWHM in A or 'auto' -> max(3.2, 3.5*d_min) (default: auto).")
+    sb.add_argument("--lam-z", default="auto", help="L2 regularization on spatial ln B nudges or 'auto' -> 2e-4*(d_min/0.965)^3 (default: auto).")
     sb.add_argument("--displace", default="auto", choices=["auto", "none", "pre", "post"], help="Ordered-water displacement mode.")
     sb.add_argument("--grid", type=float, default=0.45, help="Grid spacing in A (default: 0.45).")
     sb.add_argument("--shape", default=None, help="Explicit grid shape 'nu,nv,nw'.")
     sb.add_argument("--nconf", type=int, default=32, help="Conformer count for multi-altloc models (default: 32).")
     sb.add_argument("--bins", type=int, default=24, help="Resolution shells for per-bin k_mask (default: 24).")
     sb.add_argument("--maxiter", type=int, default=55, help="Max L-BFGS-B iterations per stage (default: 55).")
+    sb.add_argument("--no-holdout-val", action="store_true", help="Fit on all 95%% work reflections instead of holding out 5%% work_val.")
+    sb.add_argument("--no-complete-h", action="store_true", help="Disable automatic riding-hydrogen completion on H-less/partial-H PDBs.")
     sb.set_defaults(func=_cmd_fit_bmob)
 
     # 4. fit-divot
@@ -456,22 +585,33 @@ def build_parser() -> argparse.ArgumentParser:
     sd.add_argument("--fmodel-mtz", required=True, help="Phenix *_f_model.mtz (from export_final_f_model=True).")
     sd.add_argument("--out", required=True, help="Output prefix for _solvent.ccp4 and _fpart.mtz.")
     sd.add_argument("--data-mtz", default=None, help="Optional original diffraction MTZ with 20-bin FreeR_flag for work_val split.")
+    sd.add_argument("--free-flag-value", type=int, default=None,
+                    help="R-free flag value marking the test set (default: minority value of 0/1 flags, else 0).")
     sd.add_argument("--base-ccp4", default=None, help="Optional starting solvent CCP4 map (defaults to surfNturf prediction).")
     sd.add_argument("--weights", default="l2", help="surfNturf weights if generating starting base ('l2', 'kl', or .npz).")
     sd.add_argument("--arm", default="hybrid", choices=["hybrid", "peak", "divot", "sw6_mc", "sw6_std"], help="Refinement arm.")
     sd.add_argument("--grid", type=float, default=0.45, help="Grid spacing in A when generating starting base (default: 0.45).")
     sd.add_argument("--nconf", type=int, default=32, help="Conformer count when generating starting base (default: 32).")
     sd.add_argument("--ignore-waters", action="store_true", help="Do not displace ordered HOH when generating starting base.")
+    sd.add_argument("--no-complete-h", action="store_true", help="Disable automatic riding-hydrogen completion when generating base.")
+    sd.add_argument("--no-val-gate", action="store_true", help="Disable blind work_val gate against base/scale_only.")
     sd.add_argument("--workers", type=int, default=4, help="FFT worker threads (default: 4).")
     sd.set_defaults(func=_cmd_fit_divot)
 
     # 5. train
-    st = sub.add_parser("train", help="Fit surfNturf hydration PMF+OZ weights to MD solvent CCP4 maps.")
+    st = sub.add_parser("train", help="Fit surfNturf hydration PMF+LP+TetOZ weights to MD solvent CCP4 maps.")
     st.add_argument("--dataset", action="append", default=[], help="'[name:]map.ccp4:model.pdb_or_dir:B_map' (repeatable).")
     st.add_argument("--manifest", default=None, help="JSON list of {'name','map','model','B'} objects.")
     st.add_argument("--out", required=True, help="Output .npz weights path.")
     st.add_argument("--loss", default="l2", choices=["l2", "kl"], help="Real-space training loss (default: l2).")
-    st.add_argument("--n-types", type=int, default=10, choices=[2, 10], help="Chemical atom classes (default: 10).")
+    st.add_argument("--n-types", type=int, default=10, choices=[2, 10], help="Base real chemical atom classes (default: 10; +3 LP when LP enabled).")
+    st.add_argument("--no-lp", action="store_true", help="Disable explicit sp2/sp3 lone-pair virtual sites.")
+    st.add_argument("--no-tet-oz", action="store_true", help="Disable tetrahedral (109.47 deg, l=0,1,2) H-bond network closure.")
+    st.add_argument("--oz-steps", type=int, default=4, help="Number of damped self-consistent OZ closure steps (default: 4).")
+    st.add_argument("--epol", action="store_true", default=False,
+                    help="Enable screened AMBER-charge crystal E-field polarization (+Epol, off by default).")
+    st.add_argument("--no-pauli-cap", action="store_true", help="Disable Rosenfeld 0D 1-water exclusion cavity cap.")
+    st.add_argument("--no-zero-bulk", action="store_true", help="Disable exact empty-bulk asymptote subtraction.")
     st.add_argument("--step", type=int, default=2, help="Grid subsampling stride during training (default: 2).")
     st.add_argument("--nconf", type=int, default=32, help="Conformer count for multi-altloc PDBs (default: 32).")
     st.add_argument("--maxiter", type=int, default=220, help="Max L-BFGS-B iterations (default: 220).")

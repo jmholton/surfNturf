@@ -1,4 +1,4 @@
-"""General-purpose L-BFGS-B trainer for fitting surfNturf hydration PMF+OZ weights to MD solvent maps."""
+"""General-purpose L-BFGS-B trainer for fitting surfNturf hydration PMF+LP+TetOZ weights to MD solvent maps."""
 import sys
 import time
 import numpy as np
@@ -48,7 +48,6 @@ def load_ccp4_map_and_grid(map_path: str, step: int = 2):
         sub_arr = full_arr[::step, ::step, ::step][:grid.shape[0], :grid.shape[1], :grid.shape[2]]
         return grid, sub_arr
     except ValueError:
-        # Subsampling by `step` broke a space-group operator (e.g. 90 // 2 = 45 on a 2_1 axis): resample cleanly
         approx_sp = max(
             cell.a / max(full_arr.shape[0] / max(step, 1), 1.0),
             cell.b / max(full_arr.shape[1] / max(step, 1), 1.0),
@@ -66,29 +65,58 @@ def load_ccp4_map_and_grid(map_path: str, step: int = 2):
 
 
 def fit_surfnturf_model(datasets_spec, loss_mode: str = "l2", n_types: int = 10,
+                        use_lp: bool = True, use_tet_oz: bool = True, n_oz_steps: int = 4,
+                        use_epol: bool = False, use_pauli_cap: bool = True, zero_bulk_offset: bool = True,
                         use_langmuir: bool = True, use_oz: bool = True, use_hpol: bool = True,
                         use_blur: bool = True, fit_box_scale: bool = True, step: int = 2,
                         nconf: int = 32, lam_pmf: float = 2e-3, lam_hpol: float = 2e-3,
-                        lam_oz: float = 1e-4, maxiter: int = 220, out_npz: str = None):
-    """Fit a surfNturf `WaterFieldSpec` jointly across one or more `(name, map_path, model_path, B_map)` datasets."""
+                        lam_oz: float = 1e-4, lam_extra: float = 2e-4, maxiter: int = 220, out_npz: str = None):
+    """Fit a surfNturf `WaterFieldSpec` jointly across one or more `(name, map_path, model_path, B_map)` datasets.
+
+    By default (`use_lp=True, use_tet_oz=True, n_oz_steps=4, use_pauli_cap=True, zero_bulk_offset=True, use_epol=False`),
+    trains explicit sp2/sp3 lone pairs + 4-step tetrahedral (109.47 deg) H-bond network closure + Rosenfeld 0D 1-water
+    cavity cap + exact zero-offset bulk asymptote, keeping crystal E-field polarization (`use_epol`) off by default.
+    """
     t0 = time.time()
     two_type = (int(n_types) == 2)
+    use_lp_eff = bool(use_lp) and (not two_type)
+    eff_n_types = 2 if two_type else (13 if use_lp_eff else 10)
+    use_tet_eff = bool(use_tet_oz) and bool(use_oz)
+    use_epol_eff = bool(use_epol) and (not two_type)
+
     bundles = []
     for name, map_path, model_path, b_val in datasets_spec:
         grid, rho_sub = load_ccp4_map_and_grid(map_path, step=step)
-        members, wts = load_ensemble(model_path, nconf=nconf, two_type_heavy_only=two_type, return_weights=True)
-        Phi_O, Phi_H, steric_H = build_asu_features(
-            grid, members, n_types=int(n_types), include_hpol=bool(use_hpol)
+        if use_epol_eff:
+            members, wts, charges = load_ensemble(
+                model_path, nconf=nconf, two_type_heavy_only=two_type, return_weights=True,
+                use_lp=use_lp_eff, return_charges=True
+            )
+        else:
+            members, wts = load_ensemble(
+                model_path, nconf=nconf, two_type_heavy_only=two_type, return_weights=True,
+                use_lp=use_lp_eff
+            )
+            charges = None
+
+        feat_res = build_asu_features(
+            grid, members, n_types=eff_n_types, include_hpol=bool(use_hpol),
+            include_tet_oz=use_tet_eff, include_epol=use_epol_eff,
+            charges=charges, member_weights=wts, return_extra=True,
         )
+        Phi_O, Phi_H, steric_H, extra = feat_res
         bundles.append(DatasetBundle(
             name=name, grid=grid, rho_full=rho_sub, B_map=float(b_val),
-            Phi_O=Phi_O, Phi_H=Phi_H, steric_H=steric_H, member_weights=wts
+            Phi_O=Phi_O, Phi_H=Phi_H, steric_H=steric_H, member_weights=wts,
+            F_hbsol=extra['F_hbsol'], E_feats=extra['E_feats'],
         ))
 
     spec = WaterFieldSpec(
-        n_types=int(n_types), use_langmuir=bool(use_langmuir), use_oz=bool(use_oz),
+        n_types=eff_n_types, use_langmuir=bool(use_langmuir), use_oz=bool(use_oz),
         use_hpol=bool(use_hpol), use_blur=bool(use_blur), fit_box_scale=bool(fit_box_scale),
-        n_datasets=len(bundles)
+        n_datasets=len(bundles), use_lp=use_lp_eff, use_tet_oz=use_tet_eff,
+        n_oz_steps=int(n_oz_steps), use_epol=use_epol_eff,
+        use_pauli_cap=bool(use_pauli_cap), zero_bulk_offset=bool(zero_bulk_offset),
     )
     theta0 = spec.init_params()
     bounds = param_bounds(spec)
@@ -96,7 +124,7 @@ def fit_surfnturf_model(datasets_spec, loss_mode: str = "l2", n_types: int = 10,
 
     def obj_and_grad(th):
         tot_loss, tot_grad = smoothness_penalty_and_grad(
-            spec, th, lam_pmf=lam_pmf, lam_hpol=lam_hpol, lam_oz=lam_oz
+            spec, th, lam_pmf=lam_pmf, lam_hpol=lam_hpol, lam_oz=lam_oz, lam_extra=lam_extra
         )
         for idx, ds in enumerate(bundles):
             l_i, g_i, _, _ = forward_and_grad(
@@ -112,8 +140,10 @@ def fit_surfnturf_model(datasets_spec, loss_mode: str = "l2", n_types: int = 10,
     )
 
     spec_export = WaterFieldSpec(
-        n_types=int(n_types), use_langmuir=bool(use_langmuir), use_oz=bool(use_oz),
-        use_hpol=bool(use_hpol), use_blur=bool(use_blur), fit_box_scale=False, n_datasets=1
+        n_types=eff_n_types, use_langmuir=bool(use_langmuir), use_oz=bool(use_oz),
+        use_hpol=bool(use_hpol), use_blur=bool(use_blur), fit_box_scale=False, n_datasets=1,
+        use_lp=use_lp_eff, use_tet_oz=use_tet_eff, n_oz_steps=int(n_oz_steps),
+        use_epol=use_epol_eff, use_pauli_cap=bool(use_pauli_cap), zero_bulk_offset=bool(zero_bulk_offset),
     )
     theta_export = res.x[:spec_export.n_params].copy()
     written_npz = None

@@ -21,13 +21,17 @@ from surfnturf.io import (
 
 class TestSurfNTurfField(unittest.TestCase):
     def test_pretrained_weights_bundle(self):
-        for variant in ("l2", "kl"):
+        for variant in ("l2", "kl", "v1_l2", "v1_kl"):
             p = get_pretrained_weights_path(variant)
             self.assertTrue(os.path.isfile(p))
             spec, theta = load_saved_spec_and_theta(variant)
-            self.assertEqual(spec.n_params, 173)
-            self.assertEqual(len(theta), 173)
+            self.assertEqual(len(theta), spec.n_params)
             self.assertTrue(np.all(np.isfinite(theta)))
+            if variant.startswith("v1_"):
+                self.assertEqual(spec.n_params, 173)
+                self.assertFalse(spec.use_lp)
+                self.assertFalse(spec.use_tet_oz)
+                self.assertFalse(spec.use_epol)
 
     def test_ion_typing_and_multichain_hip(self):
         # Chain 1 HIS 10 is doubly protonated (HIP, ND1-NE2 = 2.15 A); Chain 2 HIS 10 is neutral HIE 15 A away
@@ -300,6 +304,114 @@ class TestSurfNTurfField(unittest.TestCase):
             rel_B = abs(g_B - g_B_fd) / max(1e-8, abs(g_B_fd))
             self.assertLess(rel, 1e-5)
             self.assertLess(rel_B, 1e-5)
+
+    def test_v2_lp_tetoz4_paulicap_zero_bulk_and_optional_epol(self):
+        from surfnturf.cli import build_parser
+
+        # Verify +Epol is OFF by default in both WaterFieldSpec and `surfnturf train` CLI
+        default_spec = WaterFieldSpec()
+        self.assertTrue(default_spec.use_lp)
+        self.assertFalse(default_spec.use_epol)
+        cli_args = build_parser().parse_args(["train", "--dataset", "m.ccp4:p.pdb:5.0", "--out", "w.npz"])
+        self.assertFalse(cli_args.epol)
+        self.assertFalse(cli_args.no_lp)
+        self.assertFalse(cli_args.no_tet_oz)
+        self.assertEqual(cli_args.oz_steps, 4)
+
+        rng = np.random.default_rng(7)
+        cell = gemmi.UnitCell(16.0, 14.0, 12.0, 90.0, 90.0, 90.0)
+        sg = gemmi.SpaceGroup("P 21 21 21")
+        grid = ASUGrid(cell, sg, (24, 20, 16), step=1)
+
+        sample_atoms = [
+            (1, "VAL", "N",   "N", [2.1, 3.2, 4.1]),
+            (1, "VAL", "H1",  "H", [2.1, 3.2, 5.1]),
+            (1, "VAL", "CA",  "C", [1.2, 4.1, 3.6]),
+            (1, "VAL", "C",   "C", [1.8, 5.4, 3.2]),
+            (1, "VAL", "O",   "O", [2.9, 5.6, 2.8]),
+            (2, "ASP", "CB",  "C", [1.0, 7.0, 3.2]),
+            (2, "ASP", "CG",  "C", [1.5, 8.0, 2.9]),
+            (2, "ASP", "OD1", "O", [1.2, 9.1, 2.5]),
+            (2, "ASP", "OD2", "O", [2.6, 7.9, 3.3]),
+            (3, "SER", "CA",  "C", [5.0, 2.8, 5.2]),
+            (3, "SER", "CB",  "C", [5.3, 3.9, 5.8]),
+            (3, "SER", "OG",  "O", [5.8, 4.9, 5.0]),  # H-less SER OG exercises staggered gauche LP_sp3 fallback
+            (4, "LYS", "NZ",  "N", [8.2, 6.2, 4.2]),
+            (4, "LYS", "HZ1", "H", [7.6, 6.9, 4.0]),
+        ]
+        x1, t1, q1 = classify_conformer_atoms(sample_atoms, use_lp=True, return_charges=True)
+        self.assertIn(10, set(t1.tolist()))  # LP_sp2 on VAL O
+        self.assertIn(11, set(t1.tolist()))  # LP_neg on ASP OD1/OD2
+        self.assertIn(12, set(t1.tolist()))  # LP_sp3 on H-less SER OG
+
+        m2_atoms = [
+            (r, rn, an, el, list(p) if idx < 6 else [p[0] + 0.18, p[1] - 0.12, p[2] + 0.09])
+            for idx, (r, rn, an, el, p) in enumerate(sample_atoms)
+        ]
+        x2, t2, q2 = classify_conformer_atoms(m2_atoms, use_lp=True, return_charges=True)
+        members = [(x1, t1), (x2, t2)]
+        charges = [q1, q2]
+        wts = [0.45, 0.55]
+
+        # 1. Exact empty-bulk asymptote: g_hat == 1.000000000000 identically in an empty cell!
+        spec_emp = WaterFieldSpec(
+            n_types=13, use_lp=True, use_tet_oz=True, n_oz_steps=4,
+            use_epol=True, use_pauli_cap=True, zero_bulk_offset=True
+        )
+        th_emp = spec_emp.init_params() + 0.35 * rng.normal(size=spec_emp.n_params)
+        empty_mem = [(np.zeros((0, 3)), np.zeros(0, dtype=np.int32))]
+        gh_emp, gO_emp = forward_direct(spec_emp, grid, empty_mem, [1.0], th_emp, B_map=5.0, charges=[np.zeros(0)])
+        self.assertLess(float(np.max(np.abs(gh_emp - 1.0))), 1e-12)
+        self.assertLess(float(np.max(np.abs(gO_emp - 1.0))), 1e-12)
+
+        # 2. Central FD gradients & forward_direct parity for BOTH use_epol=False (default) and use_epol=True
+        raw_asu = np.abs(rng.normal(loc=0.33, scale=0.20, size=grid.n_asu))
+        rho_full = grid.asu_to_full_3d(raw_asu)
+
+        for use_epol in (False, True):
+            Phi_O, Phi_H, steric_H, extra = build_asu_features(
+                grid, members, n_types=13, include_hpol=True, include_tet_oz=True,
+                include_epol=use_epol, charges=(charges if use_epol else None),
+                member_weights=wts, return_extra=True, max_workers=1
+            )
+            ds2 = DatasetBundle(
+                "v2", grid, rho_full, B_map=6.0, Phi_O=Phi_O, Phi_H=Phi_H, steric_H=steric_H,
+                member_weights=wts, F_hbsol=extra["F_hbsol"], E_feats=extra["E_feats"]
+            )
+            spec2 = WaterFieldSpec(
+                n_types=13, use_lp=True, use_tet_oz=True, n_oz_steps=4, use_epol=use_epol,
+                use_pauli_cap=True, zero_bulk_offset=True, fit_box_scale=True, n_datasets=1
+            )
+            th2 = spec2.init_params() + 0.22 * rng.normal(size=spec2.n_params)
+            th2[spec2.n_pmf] = -2.2  # exercises strong saturation + Rosenfeld 0D cavity cap actively
+
+            for loss_mode in ("l2", "kl"):
+                def eval_v2(th):
+                    l1, g1, _, _ = forward_and_grad(spec2, ds2, th, ds_index=0, loss_mode=loss_mode, compute_grad=True)
+                    l2, g2 = smoothness_penalty_and_grad(spec2, th)
+                    return l1 + l2, g1 + g2
+
+                _, g_ana = eval_v2(th2)
+                eps = 1e-6
+                g_fd = np.zeros_like(th2)
+                for i in range(len(th2)):
+                    tp = th2.copy(); tp[i] += eps
+                    tm = th2.copy(); tm[i] -= eps
+                    g_fd[i] = (eval_v2(tp)[0] - eval_v2(tm)[0]) / (2.0 * eps)
+                rel = float(np.max(np.abs(g_ana - g_fd))) / max(1.0, float(np.max(np.abs(g_fd))))
+                self.assertLess(rel, 1e-6)
+
+            spec2_inf = WaterFieldSpec(
+                n_types=13, use_lp=True, use_tet_oz=True, n_oz_steps=4, use_epol=use_epol,
+                use_pauli_cap=True, zero_bulk_offset=True, fit_box_scale=False
+            )
+            th2_inf = th2[:spec2_inf.n_params].copy()
+            gh_b, gO_b = forward_and_grad(spec2_inf, ds2, th2_inf, compute_grad=False)
+            gh_d, gO_d = forward_direct(
+                spec2_inf, grid, members, wts, th2_inf, B_map=6.0, charges=(charges if use_epol else None)
+            )
+            self.assertLess(float(np.max(np.abs(gh_b - gh_d))), 2e-5)
+            self.assertLess(float(np.max(np.abs(gO_b - gO_d))), 2e-5)
 
 
 if __name__ == "__main__":
