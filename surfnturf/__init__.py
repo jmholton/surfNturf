@@ -39,6 +39,8 @@ try:
     from .io import (
         choose_sg_grid_shape,
         resolve_crystal_symmetry,
+        read_ccp4_map_checked,
+        check_crystal_compatibility,
         load_saved_spec_and_theta,
         save_spec_and_theta,
         extract_ordered_waters,
@@ -128,6 +130,8 @@ __all__ = [
     "param_bounds",
     "choose_sg_grid_shape",
     "resolve_crystal_symmetry",
+    "read_ccp4_map_checked",
+    "check_crystal_compatibility",
     "load_saved_spec_and_theta",
     "save_spec_and_theta",
     "extract_ordered_waters",

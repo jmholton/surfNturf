@@ -140,15 +140,17 @@ class TestReconnect(unittest.TestCase):
             self.assertEqual(stats["reconnected_geom"][0], 0.0)
 
             write_member_pdbs(cryst1, confs, out_d, pseudo_path=pseudo_p)
-            m01_txt = open(os.path.join(out_d, "m01.pdb"), "r", encoding="utf-8").read()
+            with open(os.path.join(out_d, "m01.pdb"), "r", encoding="utf-8") as mf:
+                m01_txt = mf.read()
             self.assertIn("HETATM", m01_txt)
             self.assertIn("CRYST1", m01_txt)
 
-            cl_occs = [
-                float(line[54:60])
-                for line in open(pseudo_p, "r", encoding="utf-8")
-                if line.startswith("HETATM") and line[17:20].strip() == "CL"
-            ]
+            with open(pseudo_p, "r", encoding="utf-8") as pf:
+                cl_occs = [
+                    float(line[54:60])
+                    for line in pf
+                    if line.startswith("HETATM") and line[17:20].strip() == "CL"
+                ]
             self.assertEqual(len(cl_occs), 32)
             self.assertAlmostEqual(sum(cl_occs), 1.0, places=6)
 
@@ -164,7 +166,8 @@ class TestReconnect(unittest.TestCase):
                 reconnect_main([pdb_p, out_d, "nconf=10", "quotas=hamilton"])
             self.assertIn("no CRYST1", err_buf.getvalue())
 
-            m01_lines = open(os.path.join(out_d, "m01.pdb"), "r", encoding="utf-8").read().splitlines()
+            with open(os.path.join(out_d, "m01.pdb"), "r", encoding="utf-8") as mf:
+                m01_lines = mf.read().splitlines()
             self.assertFalse(any(l.startswith("CRYST1") for l in m01_lines))
             atom_lines = [l for l in m01_lines if l.startswith("ATOM  ")]
             self.assertEqual(len(atom_lines), 8)
@@ -207,10 +210,11 @@ class TestReconnect(unittest.TestCase):
             self.assertEqual(n_top, 6)
 
             write_member_pdbs(cryst1, confs, out_d)
-            for line in open(os.path.join(out_d, "m01.pdb"), "r", encoding="utf-8"):
-                if line.startswith(("ATOM  ", "HETATM")):
-                    self.assertEqual(len(line.rstrip("\r\n")), 78)
-                    self.assertLessEqual(float(line[60:66]), 999.99)
+            with open(os.path.join(out_d, "m01.pdb"), "r", encoding="utf-8") as mf:
+                for line in mf:
+                    if line.startswith(("ATOM  ", "HETATM")):
+                        self.assertEqual(len(line.rstrip("\r\n")), 78)
+                        self.assertLessEqual(float(line[60:66]), 999.99)
 
     def test_small_p1_lattice_self_clash_and_rhombohedral_r3(self):
         with tempfile.TemporaryDirectory() as td:

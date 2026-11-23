@@ -375,6 +375,8 @@ def parse_multi_altloc_pdb(pdb_path):
 
     with open(pdb_path, 'r') as fh:
         for raw_line in fh:
+            if raw_line.startswith('ENDMDL'):
+                break
             if raw_line.startswith('CRYST1') and cryst1_line is None:
                 cryst1_line = raw_line.rstrip('\r\n')
             elif raw_line.startswith(('ATOM  ', 'HETATM')):

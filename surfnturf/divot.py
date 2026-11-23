@@ -7,10 +7,11 @@ Implements:
      with exact skew-adjoint general-triclinic spectral derivatives and exact space-group symmetry across all 230 groups.
   3. Continuous-Coordinate Space-Group-Symmetric IT92 Peak Dictionary (ContinuousPeakDict).
   4. Bader Steepest-Ascent Watershed Divot Dictionary (WatershedDivotDict) seeded from exact e/A^3 work-set mFo - DFc maps.
-  5. Strict Blind Hyperparameter Selection on Internal Work Split (work_train 90% / work_val 5%; FreeR_flag == 0 untouched).
+  5. Strict Blind Hyperparameter Selection on Internal Work Split (work_train 90% / work_val 5%; R-free test set untouched).
 """
 import math
 import os
+import sys
 import time
 import numpy as np
 import gemmi
@@ -177,25 +178,44 @@ class CrystalGridOps:
         return (np.mod(H[:, 0], nu), np.mod(H[:, 1], nv), np.mod(H[:, 2], nw), in_nyq)
 
     def sf(self, rho, idx):
-        Af = sp_fft.fftn(rho, workers=self.workers)
-        ix = idx[:3]
-        vals = self.fsc * (np.conj(Af)[ix] if self.conv == 'plus' else Af[ix])
+        nu, nv, nw = self.shape
+        Ar = sp_fft.rfftn(np.asarray(rho, dtype=np.float64), s=self.shape, workers=self.workers)
+        iu, iv, iw = idx[:3]
+        neg_l = iw > (nw // 2)
+        ru = np.where(neg_l, np.mod(nu - iu, nu), iu)
+        rv = np.where(neg_l, np.mod(nv - iv, nv), iv)
+        rw = np.where(neg_l, nw - iw, iw)
+        af = np.where(neg_l, np.conj(Ar[ru, rv, rw]), Ar[ru, rv, rw])
+        vals = self.fsc * (np.conj(af) if self.conv == 'plus' else af)
         if len(idx) == 4 and not np.all(idx[3]):
             vals = np.where(idx[3], vals, 0.0 + 0.0j)
         return vals
 
     def sf_adjoint(self, G, idx):
-        Bc = np.zeros(self.shape, dtype=np.complex128)
-        g_in = np.conj(G)
-        ix = idx[:3]
+        nu, nv, nw = self.shape
+        iu, iv, iw = idx[:3]
+        g_use = np.asarray(G, dtype=np.complex128)
         if len(idx) == 4 and not np.all(idx[3]):
             m = idx[3]
-            ix = (ix[0][m], ix[1][m], ix[2][m])
-            g_in = g_in[m]
-        np.add.at(Bc, ix, g_in)
+            iu, iv, iw = iu[m], iv[m], iw[m]
+            g_use = g_use[m]
+        neg_l = iw > (nw // 2)
+        ru = np.where(neg_l, np.mod(nu - iu, nu), iu)
+        rv = np.where(neg_l, np.mod(nv - iv, nv), iv)
+        rw = np.where(neg_l, nw - iw, iw)
         if self.conv == 'plus':
-            return self.fsc * self.nvox * np.real(sp_fft.ifftn(Bc, workers=self.workers))
-        return self.fsc * np.real(sp_fft.fftn(Bc, workers=self.workers))
+            w_in = self.fsc * np.where(neg_l, g_use, np.conj(g_use))
+        else:
+            w_in = self.fsc * np.where(neg_l, np.conj(g_use), g_use)
+        Br = np.zeros((nu, nv, nw // 2 + 1), dtype=np.complex128)
+        np.add.at(Br, (ru, rv, rw), w_in)
+        C = 0.5 * Br
+        neg_u = np.mod(-np.arange(nu), nu)[:, None]
+        neg_v = np.mod(-np.arange(nv), nv)[None, :]
+        C[:, :, 0] = 0.5 * (Br[:, :, 0] + np.conj(Br[neg_u, neg_v, 0]))
+        if nw % 2 == 0:
+            C[:, :, -1] = 0.5 * (Br[:, :, -1] + np.conj(Br[neg_u, neg_v, -1]))
+        return self.nvox * sp_fft.irfftn(C, s=self.shape, workers=self.workers)
 
     def sym_s(self, f):
         fl = f.ravel()
@@ -226,29 +246,29 @@ class CrystalGridOps:
         return (out / self.nops).reshape(g.shape)
 
     def spectral_grad_scalar(self, f_3d):
-        F_r = sp_fft.rfftn(f_3d, s=self.shape, workers=self.workers)
+        F_r = sp_fft.rfftn(f_3d, s=self.shape, axes=(0, 1, 2), workers=self.workers)
         return np.stack([
-            sp_fft.irfftn(ik * F_r, s=self.shape, workers=self.workers) for ik in self.ik_r
+            sp_fft.irfftn(ik * F_r, s=self.shape, axes=(0, 1, 2), workers=self.workers) for ik in self.ik_r
         ], axis=0)
 
     def spectral_div_vector(self, v_3d):
         acc_r = np.zeros(self.stol2_r.shape, dtype=np.complex128)
         for b in range(3):
-            acc_r += self.ik_r[b] * sp_fft.rfftn(v_3d[b], s=self.shape, workers=self.workers)
-        return sp_fft.irfftn(acc_r, s=self.shape, workers=self.workers)
+            acc_r += self.ik_r[b] * sp_fft.rfftn(v_3d[b], s=self.shape, axes=(0, 1, 2), workers=self.workers)
+        return sp_fft.irfftn(acc_r, s=self.shape, axes=(0, 1, 2), workers=self.workers)
 
     def gaussian_blur(self, arr_3d, B_blur):
         if B_blur <= 0.0:
             return arr_3d.copy()
-        F_r = sp_fft.rfftn(arr_3d, s=self.shape, workers=self.workers)
-        return sp_fft.irfftn(F_r * np.exp(-float(B_blur) * self.stol2_r), s=self.shape, workers=self.workers)
+        F_r = sp_fft.rfftn(arr_3d, s=self.shape, axes=(0, 1, 2), workers=self.workers)
+        return sp_fft.irfftn(F_r * np.exp(-float(B_blur) * self.stol2_r), s=self.shape, axes=(0, 1, 2), workers=self.workers)
 
 
 def build_open_solvent_envelope(cgrid: CrystalGridOps, pdb_path, r_vdw=2.15, width=0.18, smooth_B=8.0):
-    """Compute occupancy-weighted open-solvent fraction f_open(x) in [0, 1] directly from PDB altlocs."""
+    """Compute occupancy-weighted open-solvent fraction f_open(x) in [0, 1] directly from PDB altlocs & occupancies."""
     st = gemmi.read_structure(pdb_path)
     by_alt = {}
-    blank_xyz = []
+    blank_items = []
     for ch in st[0]:
         for r in ch:
             if r.name in ('HOH', 'WAT', 'DOD'):
@@ -258,19 +278,21 @@ def build_open_solvent_envelope(cgrid: CrystalGridOps, pdb_path, r_vdw=2.15, wid
                     continue
                 pos = a.pos.tolist()
                 if a.altloc in ('\0', ' '):
-                    blank_xyz.append(pos)
+                    blank_items.append((pos, min(float(a.occ), 1.0)))
                 else:
-                    by_alt.setdefault(a.altloc, []).append((pos, float(a.occ)))
+                    by_alt.setdefault(a.altloc, []).append((pos, min(float(a.occ), 1.0)))
 
     asu_pts = cgrid.asu_xyz
     blocked_asu = np.zeros(cgrid.n_asu, dtype=np.float64)
     cut_env = float(r_vdw) + 6.0 * float(width)
 
-    if blank_xyz:
-        sx = cgrid.sym_expand_xyz(np.array(blank_xyz, dtype=np.float64), cutoff_A=cut_env)
+    if blank_items:
+        xyz_b = np.array([it[0] for it in blank_items], dtype=np.float64)
+        occ_b = np.array([it[1] for it in blank_items], dtype=np.float64)
+        sx, so = cgrid.sym_expand_xyz(xyz_b, cutoff_A=cut_env, occ_arr=occ_b)
         if len(sx):
-            d_b = cKDTree(sx).query(asu_pts)[0]
-            blocked_asu += expit((r_vdw - d_b) / width)
+            d_b, idx_b = cKDTree(sx).query(asu_pts)
+            blocked_asu += so[idx_b] * expit((r_vdw - d_b) / width)
 
     for alt, items in sorted(by_alt.items()):
         xyz_a = np.array([it[0] for it in items], dtype=np.float64)
@@ -285,6 +307,14 @@ def build_open_solvent_envelope(cgrid: CrystalGridOps, pdb_path, r_vdw=2.15, wid
     if smooth_B > 0.0:
         f_open_3d = np.clip(cgrid.sym_s(cgrid.gaussian_blur(f_open_3d, smooth_B)), 0.0, 1.0)
     return f_open_3d
+
+
+def build_solvent_support_mask(base_3d, open_mask_3d, base_thresh=0.010, open_floor=0.25, open_span=0.15):
+    """Smooth [0, 1] support mask that is identically 0 deep inside the excluded protein core (`base == 0` & `open <= 0.25`)
+    and 1 throughout hydration shells (`base >= 0.010 e/A^3`) and open cavities/channels (`open >= 0.40`)."""
+    b = np.asarray(base_3d, dtype=np.float64)
+    om = np.asarray(open_mask_3d, dtype=np.float64)
+    return np.clip(np.maximum(b / float(base_thresh), (om - float(open_floor)) / float(open_span)), 0.0, 1.0)
 
 
 def tricubic_bhat(shape):
@@ -566,10 +596,11 @@ def pick_asu_difference_peaks(cgrid: CrystalGridOps, diff_maps_and_sigmas, open_
 class ContinuousPeakDict:
     """Continuous-coordinate space-group-symmetric IT92 Gaussian water/ion dictionary (zero grid-edge ripple)."""
 
-    def __init__(self, cgrid: CrystalGridOps, peak_seeds, B_base=2.0, half_win=9, max_shift=0.75):
+    def __init__(self, cgrid: CrystalGridOps, peak_seeds, B_base=2.0, half_win=9, max_shift=0.75, b_min=None):
         self.cgrid = cgrid
         self.M = len(peak_seeds)
         self.B_base = float(B_base)
+        self.b_min = float(b_min) if b_min is not None else 5.5
         self.half_win = int(half_win)
         self.max_shift = float(max_shift)
         self.xyz0 = np.array([p['xyz0'] for p in peak_seeds], dtype=np.float64) if self.M else np.zeros((0, 3))
@@ -580,17 +611,23 @@ class ContinuousPeakDict:
         self.offs = np.arange(-self.half_win, self.half_win + 1, dtype=np.int32)
         self.n_params = 5 * self.M
 
+    def _eta_bounds(self):
+        lo_dB = max(3.5, self.b_min - self.B_base)
+        hi_dB = max(95.0, lo_dB + 60.0)
+        return math.log(lo_dB), math.log(hi_dB)
+
     def init_params(self):
         if self.M == 0:
             return np.zeros(0, dtype=np.float64)
         p = np.zeros((self.M, 5), dtype=np.float64)
-        p[:, 4] = np.log(np.clip(self.B_init - self.B_base, 4.0, 60.0))
+        lo_eta, hi_eta = self._eta_bounds()
+        p[:, 4] = np.clip(np.log(np.clip(self.B_init - self.B_base, 4.0, 120.0)), lo_eta, hi_eta)
         return p.ravel()
 
     def bounds(self):
         b = []
         ms = self.max_shift
-        lo_eta, hi_eta = math.log(3.5), math.log(95.0)
+        lo_eta, hi_eta = self._eta_bounds()
         for _ in range(self.M):
             b.extend([(-1.8, 2.8), (-ms, ms), (-ms, ms), (-ms, ms), (lo_eta, hi_eta)])
         return b
@@ -787,10 +824,21 @@ class SolventAmplitudeProblem:
     P_LO = np.array([0.50, K_SOLV_MIN], dtype=np.float64)
     P_HI = np.array([1.50, 5.00], dtype=np.float64)
 
-    def __init__(self, cgrid: CrystalGridOps, H, Fo, free_mask, K_scale, F_calc, train_mask=None, val_mask=None):
+    def __init__(self, cgrid: CrystalGridOps, H, Fo, free_mask, K_scale, F_calc, train_mask=None, val_mask=None,
+                 k_solv_mode: str = 'free', f_model_ref=None):
+        if k_solv_mode not in ('free', 'fixed_one'):
+            raise ValueError(f"k_solv_mode must be 'free' or 'fixed_one', got {k_solv_mode!r}")
+        self.k_solv_mode = str(k_solv_mode)
         self.cgrid = cgrid
         self.H = np.asarray(H, dtype=int)
         self.idx = cgrid.hkl_idx(self.H)
+        if len(self.idx) == 4 and not np.all(self.idx[3]):
+            n_out = int(np.sum(~self.idx[3]))
+            print(
+                f"surfnturf warning: {n_out}/{len(self.H)} reflections exceed base grid {cgrid.shape} Nyquist limit "
+                f"and have FPART=0 during divot fitting",
+                file=sys.stderr,
+            )
         self.Fo = np.asarray(Fo, dtype=np.float64)
         self.free = np.asarray(free_mask, dtype=bool)
         self.work = ~self.free
@@ -798,13 +846,14 @@ class SolventAmplitudeProblem:
             raise ValueError(f"SolventAmplitudeProblem requires at least 2 work reflections (got {int(np.sum(self.work))})")
         self.K = np.asarray(K_scale, dtype=np.float64)
         self.Q = np.asarray(F_calc, dtype=np.complex128)
+        self.f_model_ref = np.asarray(f_model_ref, dtype=np.float64) if f_model_ref is not None else None
 
         self.stol2 = 0.25 * np.asarray(cgrid.cell.calculate_1_d2_array(self.H), dtype=np.float64)
         self.d_arr = 1.0 / np.sqrt(np.maximum(4.0 * self.stol2, 1e-12))
 
         if train_mask is None or val_mask is None:
             from .bmob import make_work_train_val_split
-            self.train, self.val = make_work_train_val_split(self.H, self.d_arr, self.free)
+            self.train, self.val = make_work_train_val_split(self.H, self.d_arr, self.free, spacegroup=cgrid.sg)
         else:
             self.train = np.asarray(train_mask, dtype=bool) & self.work
             self.val = np.asarray(val_mask, dtype=bool) & self.work
@@ -829,17 +878,32 @@ class SolventAmplitudeProblem:
             return float('nan')
         return float(np.sum(np.abs(self.Fo[sel] - np.abs(Fm[sel]))) / denom)
 
-    def solve_inner_scales(self, P, sel_mask, p_init=None, nit=20):
-        """Box-constrained 2D Gauss-Newton for p = [k_prot, k_solv] in [0.50, 1.50] x [K_SOLV_MIN, 5.00].
+    def eval_fmodel_ref_r(self, sel):
+        if self.f_model_ref is None or not np.any(sel):
+            return float('nan')
+        denom = float(np.sum(self.Fo[sel]))
+        if denom <= 0.0:
+            return float('nan')
+        return float(np.sum(np.abs(self.Fo[sel] - self.f_model_ref[sel])) / denom)
 
-        Gauss-Newton runs from each fixed start (plus `p_init` if given) and the lowest final loss wins, so the
-        result depends only on (P, sel_mask, p_init), never on earlier calls.
+    def solve_inner_scales(self, P, sel_mask, p_init=None, nit=20):
+        """Solve inner amplitude scales on `sel_mask`.
+
+        In `'fixed_one'` mode (default for calibrated e/A^3 solvent maps), locks `k_solv == k_prot == k0` via
+        closed-form projection onto [P_LO[0], P_HI[0]], preventing L1-regularized peak dictionaries from cheating by
+        inflating `k_solv / k_prot`. In `'free'` mode, runs history-free 2D box-constrained Gauss-Newton.
         """
         lo, hi = self.P_LO, self.P_HI
         w = sel_mask
         Qw = (self.K * self.Q)[w]
         Pw = (self.K * P)[w]
         Fow = self.Fo[w]
+
+        if self.k_solv_mode == 'fixed_one':
+            au = np.abs(Qw + Pw)
+            k0 = float(np.dot(au, Fow) / max(float(np.dot(au, au)), 1e-12))
+            k0 = float(np.clip(k0, lo[0], hi[0]))
+            return np.array([k0, k0], dtype=np.float64)
 
         def _obj(pv):
             res = Fow - np.abs(pv[0] * Qw + pv[1] * Pw)
@@ -953,7 +1017,7 @@ class SolventAmplitudeProblem:
         dF = np.zeros(len(self.Fo), dtype=np.complex128)
         dF[use_mask] = (
             self.diff_map_weight[use_mask]
-            * ((self.Fo[use_mask] - a[use_mask]) / np.maximum(self.K[use_mask], 1e-6))
+            * ((self.Fo[use_mask] - a[use_mask]) / np.maximum(ev['p'][0] * self.K[use_mask], 1e-6))
             * phase[use_mask]
             * dw[use_mask]
         )
@@ -976,9 +1040,19 @@ class SolventAmplitudeProblem:
 
 def write_fpart_cgrid(cgrid: CrystalGridOps, rho_3d, hkl_mtz_path, out_mtz_path, col_names=('FPART', 'PHIPART')):
     """Write reciprocal-space solvent structure factors FPART/PHIPART onto the Miller indices of `hkl_mtz_path`."""
+    from .io import check_crystal_compatibility
     m = gemmi.read_mtz_file(hkl_mtz_path)
+    check_crystal_compatibility(cgrid.cell, cgrid.sg, "solvent grid", m.cell, m.spacegroup, str(hkl_mtz_path))
     H = np.array(m.make_miller_array(), dtype=int)
-    v = cgrid.sf(rho_3d, cgrid.hkl_idx(H))
+    idx = cgrid.hkl_idx(H)
+    if len(idx) == 4 and not np.all(idx[3]):
+        n_out = int(np.sum(~idx[3]))
+        print(
+            f"surfnturf warning: {n_out}/{len(H)} reflections in {hkl_mtz_path} exceed grid {cgrid.shape} Nyquist limit "
+            f"and are set to FPART=0",
+            file=sys.stderr,
+        )
+    v = cgrid.sf(rho_3d, idx)
     out = gemmi.Mtz(with_base=True)
     out.cell = m.cell
     out.spacegroup = m.spacegroup
@@ -991,7 +1065,8 @@ def write_fpart_cgrid(cgrid: CrystalGridOps, rho_3d, hkl_mtz_path, out_mtz_path,
 
 
 def extract_problem_from_fmodel(cgrid: CrystalGridOps, fmodel_mtz_path: str, data_mtz_path: str = None,
-                                free_flag_col: str = 'FreeR_flag', free_flag_value=None):
+                                free_flag_col: str = 'FreeR_flag', free_flag_value=None,
+                                k_solv_mode: str = 'fixed_one'):
     """Build SolventAmplitudeProblem from a Phenix `*_f_model.mtz` file (`export_final_f_model=True`)."""
     fm = gemmi.read_mtz_file(fmodel_mtz_path)
     lbls = fm.column_labels()
@@ -1050,14 +1125,23 @@ def extract_problem_from_fmodel(cgrid: CrystalGridOps, fmodel_mtz_path: str, dat
     K_scale = cK * kk
 
     from .bmob import make_work_train_val_split
+    from .io import resolve_crystal_symmetry, check_crystal_compatibility
+    sg_hm = fm.spacegroup.hm if fm.spacegroup is not None else ""
+    mtz_cell, mtz_sg = resolve_crystal_symmetry(fm.cell, sg_hm, source_desc=str(fmodel_mtz_path))
+    check_crystal_compatibility(cgrid.cell, cgrid.sg, "solvent grid", mtz_cell, mtz_sg, str(fmodel_mtz_path))
+    if data_mtz_path is not None and os.path.isfile(data_mtz_path):
+        dm_chk = gemmi.read_mtz_file(data_mtz_path)
+        check_crystal_compatibility(mtz_cell, mtz_sg, str(fmodel_mtz_path), dm_chk.cell, dm_chk.spacegroup, str(data_mtz_path))
+
     free_v = free[valid]
     train_v, val_v = make_work_train_val_split(
-        H[valid], None, free_v, data_mtz_path=data_mtz_path, free_flag_col=free_flag_col, spacegroup=cgrid.sg
+        H[valid], None, free_v, data_mtz_path=data_mtz_path, free_flag_col=free_flag_col, spacegroup=mtz_sg
     )
 
     return SolventAmplitudeProblem(
         cgrid, H[valid], Fo[valid], free_v, K_scale[valid], Fc[valid],
-        train_mask=train_v, val_mask=val_v
+        train_mask=train_v, val_mask=val_v, k_solv_mode=k_solv_mode,
+        f_model_ref=np.abs(Fmod)[valid],
     )
 
 
@@ -1108,142 +1192,206 @@ def fit_periodic_arm(prob: SolventAmplitudeProblem, pf: PeriodicFourierFields,
 
 
 def fit_scale_divot_peak_given_hp(prob: SolventAmplitudeProblem, cgrid: CrystalGridOps, base_3d, open_mask_3d,
-                                   active_mask, fitreso_s=10.0, use_divots=True, use_peaks=True,
+                                   active_mask, fitreso_s=12.0, use_divots=True, use_peaks=True,
                                    z_thresh=3.4, lam_l1=4e-5, rs=1e-4, n_passes=1, max_peaks_per_pass=90,
-                                   maxiter_s0=60, maxiter_joint=130):
+                                   maxiter_s0=60, maxiter_joint=130, precomputed_s0=None,
+                                   warm_state=None, return_state: bool = False, use_scale: bool = True):
     """Fit S(x)*base(x) + WatershedDivots + ContinuousPeakDict strictly on active_mask (NEVER free!)."""
     d_min_p = float(np.min(prob.d_arr)) if len(prob.d_arr) else 1.0
+    n_active = max(int(np.sum(active_mask)), 1)
     fitreso_eff = max(float(fitreso_s), round(4.0 * d_min_p, 2)) if d_min_p > 1.50 else float(fitreso_s)
     b_lo = max(6.0, round(3.0 * (d_min_p ** 2), 1)) if d_min_p > 1.45 else 6.0
     b_hi = max(22.0, round(8.0 * (d_min_p ** 2), 1)) if d_min_p > 1.45 else 22.0
     rmax_eff = max(2.2, round(1.3 * d_min_p, 2)) if d_min_p > 1.70 else 2.2
     min_sep_eff = max(1.35, round(0.85 * d_min_p, 2)) if d_min_p > 1.60 else 1.35
+    b_peak_min = max(5.5, 4.0 * (d_min_p ** 2))
+    rs_eff = float(rs) * max(1.0, (d_min_p / 1.0) ** 2)
 
-    pf_s = PeriodicFourierFields(cgrid, base_3d, fitreso_s=fitreso_eff, use_scale=True, use_warp=False)
+    max_peaks_eff = min(int(max_peaks_per_pass), max(8, n_active // 200))
+    max_divots_eff = min(180, max(10, n_active // 160))
+    n_passes_eff = (1 if d_min_p > 2.0 else int(n_passes)) if int(n_passes) > 0 else 0
 
-    def obj_s0(cs):
-        rho_s, _, _, pb_s = pf_s.forward_and_pullback(cs, compute_grad=True)
-        ev = prob.eval_rho(rho_s, active_mask=active_mask, compute_grad=True)
-        return ev['loss'] + rs * float(cs @ cs), pb_s(ev['grho']) + 2.0 * rs * cs
+    supp_mask = build_solvent_support_mask(base_3d, open_mask_3d)
+    pf_s = PeriodicFourierFields(cgrid, base_3d, fitreso_s=fitreso_eff, use_scale=bool(use_scale), use_warp=False)
 
-    res_s0 = minimize(obj_s0, np.zeros(pf_s.nx), method='L-BFGS-B', jac=True,
-                      bounds=[(-2.5, 2.5)] * pf_s.nx, options={'maxiter': maxiter_s0, 'ftol': 1e-10})
-    cs_cur = res_s0.x.copy()
-    rho_s_only, _, _, _ = pf_s.forward_and_pullback(cs_cur, compute_grad=False)
-    rho_cur, _ = softplus_pos(rho_s_only, tau=0.012) if n_passes == 0 else (rho_s_only, None)
-
-    all_peak_seeds = []
-    all_peak_params = np.zeros(0, dtype=np.float64)
-    wdiv = None
-    w_div_cur = np.zeros(0, dtype=np.float64)
-
-    for p_idx in range(n_passes):
-        dmap_8 = prob.compute_work_diff_map(rho_cur, active_mask=active_mask, B_smooth=b_lo)
-        dmap_22 = prob.compute_work_diff_map(rho_cur, active_mask=active_mask, B_smooth=b_hi)
-
-        if use_divots and p_idx == 0:
-            wdiv = WatershedDivotDict(
-                cgrid, dmap_8, open_mask_3d,
-                z_peak=max(2.5, z_thresh - 0.3), z_floor=1.6, rmax_A=rmax_eff, max_divots=180, smooth_B=2.5
-            )
-            w_div_cur = np.zeros(wdiv.K, dtype=np.float64)
-
-        if use_peaks:
-            new_seeds = pick_asu_difference_peaks(
-                cgrid, [(b_lo, dmap_8), (b_hi, dmap_22)], open_mask_3d,
-                z_thresh=(z_thresh if p_idx == 0 else z_thresh + 0.2),
-                max_peaks=max_peaks_per_pass, min_sep_A=min_sep_eff
-            )
-            if all_peak_seeds and new_seeds:
-                prev_pdict = ContinuousPeakDict(cgrid, all_peak_seeds)
-                _, dxyz_prev, _ = prev_pdict.unpack(all_peak_params)
-                prev_xyz = prev_pdict.xyz0 + dxyz_prev
-                sym_prev = cgrid.sym_expand_xyz(prev_xyz, cutoff_A=2.5)
-                if len(sym_prev):
-                    tree_prev = cKDTree(sym_prev)
-                    filtered_new = [ns for ns in new_seeds if tree_prev.query(ns['xyz0'])[0] >= 1.25]
-                else:
-                    filtered_new = new_seeds
-            else:
-                filtered_new = new_seeds
-
-            if filtered_new:
-                new_pdict = ContinuousPeakDict(cgrid, filtered_new)
-                all_peak_seeds.extend(filtered_new)
-                all_peak_params = np.concatenate([all_peak_params, new_pdict.init_params()])
-
-        pdict = ContinuousPeakDict(cgrid, all_peak_seeds) if use_peaks else ContinuousPeakDict(cgrid, [])
-        n_s = pf_s.nx
-        n_d = wdiv.K if (use_divots and wdiv is not None) else 0
-        n_p = pdict.n_params
-
-        x_init = np.concatenate([cs_cur, w_div_cur if n_d else np.zeros(0), all_peak_params if n_p else np.zeros(0)])
-        bounds = (
-            [(-2.5, 2.5)] * n_s +
-            [(-4.0, 6.0)] * n_d +
-            pdict.bounds()
-        )
-
+    def _make_joint_obj(wdiv_cur, pdict_cur, n_s_cur, n_d_cur, n_p_cur, l1_cur):
         def obj_joint(vec):
-            cs_v = vec[:n_s]
-            wd_v = vec[n_s:n_s + n_d]
-            pk_v = vec[n_s + n_d:]
+            cs_v = vec[:n_s_cur]
+            wd_v = vec[n_s_cur:n_s_cur + n_d_cur]
+            pk_v = vec[n_s_cur + n_d_cur:]
 
             rho_s, _, _, pb_s = pf_s.forward_and_pullback(cs_v, compute_grad=True)
             tot_raw = rho_s
             pb_d = pb_p = None
-            if n_d:
-                rho_d, pb_d = wdiv.forward_and_pullback(wd_v, compute_grad=True)
+            if n_d_cur:
+                rho_d, pb_d = wdiv_cur.forward_and_pullback(wd_v, compute_grad=True)
                 tot_raw = tot_raw + rho_d
-            if n_p:
-                rho_p, pb_p = pdict.forward_and_pullback(pk_v, compute_grad=True)
+            if n_p_cur:
+                rho_p, pb_p = pdict_cur.forward_and_pullback(pk_v, compute_grad=True)
                 tot_raw = tot_raw + rho_p
 
-            rho_pos, dpos = softplus_pos(tot_raw, tau=0.012)
+            sp_val, dpos = softplus_pos(tot_raw, tau=0.012)
+            rho_pos = supp_mask * sp_val
             ev = prob.eval_rho(rho_pos, active_mask=active_mask, compute_grad=True)
-            gtot = ev['grho'] * dpos
+            gtot = ev['grho'] * (supp_mask * dpos)
 
-            pen = rs * float(cs_v @ cs_v)
-            gcs = pb_s(gtot) + 2.0 * rs * cs_v
+            pen = rs_eff * float(cs_v @ cs_v)
+            gcs = pb_s(gtot) + 2.0 * rs_eff * cs_v
 
-            if n_d:
+            if n_d_cur:
                 l1_d, gl1_d = smooth_l1_penalty(wd_v, eps=0.02)
-                pen += lam_l1 * l1_d
-                gwd = pb_d(gtot) + lam_l1 * gl1_d
+                pen += l1_cur * l1_d
+                gwd = pb_d(gtot) + l1_cur * gl1_d
             else:
                 gwd = np.zeros(0)
 
-            if n_p:
-                dq_v, dxyz_v, _ = pdict.unpack(pk_v)
+            if n_p_cur:
+                dq_v, dxyz_v, _ = pdict_cur.unpack(pk_v)
                 l1_p, gl1_dq = smooth_l1_penalty(dq_v, eps=0.015)
                 pen_xyz = 2e-6 * float(np.sum(dxyz_v ** 2))
-                pen += lam_l1 * l1_p + pen_xyz
+                pen += l1_cur * l1_p + pen_xyz
                 gpk = pb_p(gtot).reshape(-1, 5)
-                gpk[:, 0] += lam_l1 * gl1_dq
+                gpk[:, 0] += l1_cur * gl1_dq
                 gpk[:, 1:4] += 4e-6 * dxyz_v
                 gpk = gpk.ravel()
             else:
                 gpk = np.zeros(0)
 
             return ev['loss'] + pen, np.concatenate([gcs, gwd, gpk])
+        return obj_joint
 
-        res_j = minimize(obj_joint, x_init, method='L-BFGS-B', jac=True, bounds=bounds,
-                         options={'maxiter': maxiter_joint, 'ftol': 1e-11, 'gtol': 1e-8})
-        cs_cur = res_j.x[:n_s]
+    if warm_state is not None:
+        wdiv, all_peak_seeds, x_warm = warm_state
+        pdict = ContinuousPeakDict(cgrid, all_peak_seeds, b_min=b_peak_min) if use_peaks else ContinuousPeakDict(cgrid, [])
+        n_s = pf_s.nx
+        n_d = wdiv.K if (use_divots and wdiv is not None) else 0
+        n_p = pdict.n_params
+        bounds = [(-2.5, 2.5)] * n_s + [(-4.0, 6.0)] * n_d + pdict.bounds()
+        if len(x_warm) > 0:
+            res_j = minimize(
+                _make_joint_obj(wdiv, pdict, n_s, n_d, n_p, float(lam_l1)),
+                x_warm, method='L-BFGS-B', jac=True, bounds=bounds,
+                options={'maxiter': maxiter_joint, 'ftol': 1e-11, 'gtol': 1e-8},
+            )
+            x_sol = res_j.x
+        else:
+            res_j = None
+            x_sol = np.zeros(0, dtype=np.float64)
+        cs_cur = x_sol[:n_s]
+        w_div_cur = x_sol[n_s:n_s + n_d] if n_d else np.zeros(0, dtype=np.float64)
+        all_peak_params = x_sol[n_s + n_d:] if n_p else np.zeros(0, dtype=np.float64)
+        tot_raw = pf_s.forward_and_pullback(cs_cur, compute_grad=False)[0]
         if n_d:
-            w_div_cur = res_j.x[n_s:n_s + n_d]
+            tot_raw = tot_raw + wdiv.forward_and_pullback(w_div_cur, compute_grad=False)[0]
         if n_p:
-            all_peak_params = res_j.x[n_s + n_d:]
+            tot_raw = tot_raw + pdict.forward_and_pullback(all_peak_params, compute_grad=False)[0]
+        rho_cur = supp_mask * softplus_pos(tot_raw, tau=0.012)[0]
+    else:
+        if not use_scale:
+            cs_cur = np.zeros(0, dtype=np.float64)
+            rho_s_only = np.asarray(base_3d, dtype=np.float64)
+            dmap0_8 = precomputed_s0[2] if precomputed_s0 is not None else None
+            dmap0_22 = precomputed_s0[3] if precomputed_s0 is not None else None
+        elif precomputed_s0 is not None:
+            cs_cur, rho_s_only, dmap0_8, dmap0_22 = precomputed_s0
+            cs_cur = cs_cur.copy()
+        else:
+            def obj_s0(cs):
+                rho_s, _, _, pb_s = pf_s.forward_and_pullback(cs, compute_grad=True)
+                ev = prob.eval_rho(rho_s, active_mask=active_mask, compute_grad=True)
+                return ev['loss'] + rs_eff * float(cs @ cs), pb_s(ev['grho']) + 2.0 * rs_eff * cs
 
-        rho_s, _, _, _ = pf_s.forward_and_pullback(cs_cur, compute_grad=False)
-        tot_raw = rho_s
-        if n_d:
-            rd, _ = wdiv.forward_and_pullback(w_div_cur, compute_grad=False)
-            tot_raw = tot_raw + rd
-        if n_p:
-            rp, _ = pdict.forward_and_pullback(all_peak_params, compute_grad=False)
-            tot_raw = tot_raw + rp
-        rho_cur, _ = softplus_pos(tot_raw, tau=0.012)
+            res_s0 = minimize(obj_s0, np.zeros(pf_s.nx), method='L-BFGS-B', jac=True,
+                              bounds=[(-2.5, 2.5)] * pf_s.nx, options={'maxiter': maxiter_s0, 'ftol': 1e-10})
+            cs_cur = res_s0.x.copy()
+            rho_s_only, _, _, _ = pf_s.forward_and_pullback(cs_cur, compute_grad=False)
+            dmap0_8 = dmap0_22 = None
+
+        rho_cur = (supp_mask * softplus_pos(rho_s_only, tau=0.012)[0]) if n_passes_eff == 0 else rho_s_only
+
+        all_peak_seeds = []
+        all_peak_params = np.zeros(0, dtype=np.float64)
+        wdiv = None
+        w_div_cur = np.zeros(0, dtype=np.float64)
+        res_j = None
+
+        for p_idx in range(n_passes_eff):
+            if p_idx == 0 and dmap0_8 is not None and dmap0_22 is not None:
+                dmap_8, dmap_22 = dmap0_8, dmap0_22
+            else:
+                dmap_8 = prob.compute_work_diff_map(rho_cur, active_mask=active_mask, B_smooth=b_lo)
+                dmap_22 = prob.compute_work_diff_map(rho_cur, active_mask=active_mask, B_smooth=b_hi)
+
+            if use_divots and p_idx == 0:
+                wdiv = WatershedDivotDict(
+                    cgrid, dmap_8, open_mask_3d,
+                    z_peak=max(2.5, z_thresh - 0.3), z_floor=1.6, rmax_A=rmax_eff,
+                    max_divots=max_divots_eff, smooth_B=2.5,
+                )
+                w_div_cur = np.zeros(wdiv.K, dtype=np.float64)
+
+            if use_peaks:
+                new_seeds = pick_asu_difference_peaks(
+                    cgrid, [(b_lo, dmap_8), (b_hi, dmap_22)], open_mask_3d,
+                    z_thresh=(z_thresh if p_idx == 0 else z_thresh + 0.2),
+                    max_peaks=max_peaks_eff, min_sep_A=min_sep_eff,
+                )
+                for ns in new_seeds:
+                    ns['B_init'] = max(float(ns['B_init']), b_peak_min + 2.0)
+
+                if all_peak_seeds and new_seeds:
+                    prev_pdict = ContinuousPeakDict(cgrid, all_peak_seeds, b_min=b_peak_min)
+                    _, dxyz_prev, _ = prev_pdict.unpack(all_peak_params)
+                    prev_xyz = prev_pdict.xyz0 + dxyz_prev
+                    sym_prev = cgrid.sym_expand_xyz(prev_xyz, cutoff_A=2.5)
+                    if len(sym_prev):
+                        tree_prev = cKDTree(sym_prev)
+                        filtered_new = [ns for ns in new_seeds if tree_prev.query(ns['xyz0'])[0] >= 1.25]
+                    else:
+                        filtered_new = new_seeds
+                else:
+                    filtered_new = new_seeds
+
+                if filtered_new:
+                    new_pdict = ContinuousPeakDict(cgrid, filtered_new, b_min=b_peak_min)
+                    all_peak_seeds.extend(filtered_new)
+                    all_peak_params = np.concatenate([all_peak_params, new_pdict.init_params()])
+
+            pdict = ContinuousPeakDict(cgrid, all_peak_seeds, b_min=b_peak_min) if use_peaks else ContinuousPeakDict(cgrid, [])
+            n_s = pf_s.nx
+            n_d = wdiv.K if (use_divots and wdiv is not None) else 0
+            n_p = pdict.n_params
+
+            x_init = np.concatenate([cs_cur, w_div_cur if n_d else np.zeros(0), all_peak_params if n_p else np.zeros(0)])
+            bounds = (
+                [(-2.5, 2.5)] * n_s +
+                [(-4.0, 6.0)] * n_d +
+                pdict.bounds()
+            )
+
+            if len(x_init) > 0:
+                res_j = minimize(
+                    _make_joint_obj(wdiv, pdict, n_s, n_d, n_p, float(lam_l1)),
+                    x_init, method='L-BFGS-B', jac=True, bounds=bounds,
+                    options={'maxiter': maxiter_joint, 'ftol': 1e-11, 'gtol': 1e-8},
+                )
+                cs_cur = res_j.x[:n_s]
+                if n_d:
+                    w_div_cur = res_j.x[n_s:n_s + n_d]
+                if n_p:
+                    all_peak_params = res_j.x[n_s + n_d:]
+            else:
+                res_j = None
+
+            rho_s, _, _, _ = pf_s.forward_and_pullback(cs_cur, compute_grad=False)
+            tot_raw = rho_s
+            if n_d:
+                rd, _ = wdiv.forward_and_pullback(w_div_cur, compute_grad=False)
+                tot_raw = tot_raw + rd
+            if n_p:
+                rp, _ = pdict.forward_and_pullback(all_peak_params, compute_grad=False)
+                tot_raw = tot_raw + rp
+            rho_cur = supp_mask * softplus_pos(tot_raw, tau=0.012)[0]
 
     n_active_peaks = int(np.sum(np.abs(all_peak_params[0::5]) > 0.05)) if len(all_peak_params) else 0
     n_active_divs = int(np.sum(np.abs(w_div_cur) > 0.05)) if len(w_div_cur) else 0
@@ -1258,55 +1406,89 @@ def fit_scale_divot_peak_given_hp(prob: SolventAmplitudeProblem, cgrid: CrystalG
         'r_train': ev_end['r_train'],
         'r_val': ev_end['r_val'],
     }
+    if return_state:
+        x_end = res_j.x.copy() if res_j is not None else cs_cur.copy()
+        return rho_cur, info, (wdiv, list(all_peak_seeds), x_end)
     return rho_cur, info
 
 
 def fit_adaptive_divot_peak_blind(prob: SolventAmplitudeProblem, cgrid: CrystalGridOps, base_3d, open_mask_3d,
-                                  fitreso_s=10.0, use_divots=True, use_peaks=True, n_passes=1,
-                                  hp_grid=None, gate_on_val: bool = True, min_rval_gain: float = 1e-4):
+                                  fitreso_s=12.0, use_divots=True, use_peaks=True, n_passes=1,
+                                  hp_grid=None, gate_on_val: bool = True, min_rval_gain='auto'):
     """Select (base vs scale_only vs (z_thresh, lam_l1)) strictly on work_val (blind to FreeR_flag==0!)."""
     t0 = time.time()
     d_min_p = float(np.min(prob.d_arr)) if len(prob.d_arr) else 1.0
     if hp_grid is None:
         if d_min_p >= 1.35:
-            hp_grid = ((4.4, 2.0e-4), (3.8, 8e-5), (3.3, 3e-5), (2.9, 1.2e-5))
+            hp_grid = ((4.4, 3.0e-4), (3.8, 1.2e-4), (3.3, 4.5e-5), (2.9, 1.8e-5))
         else:
-            hp_grid = ((3.8, 8e-5), (3.3, 3e-5), (2.9, 1.2e-5))
+            hp_grid = ((3.8, 1.2e-4), (3.3, 4.5e-5), (2.9, 1.8e-5))
 
     ev_base = prob.eval_rho(base_3d, active_mask=prob.train, compute_grad=False)
     rval_base = ev_base['r_val'] if math.isfinite(ev_base['r_val']) else ev_base['r_train']
+    rval_fmodel_in = prob.eval_fmodel_ref_r(prob.val)
+    rval_gate_ref = min(float(rval_base), float(rval_fmodel_in)) if math.isfinite(rval_fmodel_in) else float(rval_base)
 
-    _, inf_s0 = fit_scale_divot_peak_given_hp(
-        prob, cgrid, base_3d, open_mask_3d, active_mask=prob.train,
-        fitreso_s=fitreso_s, use_divots=False, use_peaks=False,
-        z_thresh=9.9, lam_l1=1e-3, n_passes=0, maxiter_s0=45, maxiter_joint=1
-    )
-    rval_scale = inf_s0['r_val'] if math.isfinite(inf_s0['r_val']) else inf_s0['r_train']
+    if min_rval_gain is None or str(min_rval_gain).strip().lower() == 'auto':
+        n_val = max(int(np.sum(prob.val)), 1)
+        min_gain = max(1e-3, 0.80 * rval_gate_ref / math.sqrt(2.0 * n_val))
+    else:
+        min_gain = float(min_rval_gain)
+
+    # Fit S(x) once on prob.train; only retain S(x) inside joint divot+peak if S(x) itself generalizes on work_val
+    fitreso_eff = max(float(fitreso_s), round(4.0 * d_min_p, 2)) if d_min_p > 1.50 else float(fitreso_s)
+    b_lo = max(6.0, round(3.0 * (d_min_p ** 2), 1)) if d_min_p > 1.45 else 6.0
+    b_hi = max(22.0, round(8.0 * (d_min_p ** 2), 1)) if d_min_p > 1.45 else 22.0
+    rs_eff = 1e-4 * max(1.0, (d_min_p / 1.0) ** 2)
+    pf_s0 = PeriodicFourierFields(cgrid, base_3d, fitreso_s=fitreso_eff, use_scale=True, use_warp=False)
+    supp_mask = build_solvent_support_mask(base_3d, open_mask_3d)
+
+    def obj_s0_tr(cs):
+        rho_s, _, _, pb_s = pf_s0.forward_and_pullback(cs, compute_grad=True)
+        ev = prob.eval_rho(rho_s, active_mask=prob.train, compute_grad=True)
+        return ev['loss'] + rs_eff * float(cs @ cs), pb_s(ev['grho']) + 2.0 * rs_eff * cs
+
+    res_s0 = minimize(obj_s0_tr, np.zeros(pf_s0.nx), method='L-BFGS-B', jac=True,
+                      bounds=[(-2.5, 2.5)] * pf_s0.nx, options={'maxiter': 45, 'ftol': 1e-10})
+    cs_s0 = res_s0.x.copy()
+    rho_s0_raw, _, _, _ = pf_s0.forward_and_pullback(cs_s0, compute_grad=False)
+    rho_s0_pos = supp_mask * softplus_pos(rho_s0_raw, tau=0.012)[0]
+    ev_s0 = prob.eval_rho(rho_s0_pos, active_mask=prob.train, compute_grad=False)
+    rval_scale = ev_s0['r_val'] if math.isfinite(ev_s0['r_val']) else ev_s0['r_train']
+
+    use_scale_joint = (not (gate_on_val and np.any(prob.val))) or (rval_scale < rval_gate_ref - min_gain)
+    seed_rho0 = rho_s0_raw if use_scale_joint else np.asarray(base_3d, dtype=np.float64)
+    dmap0_8 = prob.compute_work_diff_map(seed_rho0, active_mask=prob.train, B_smooth=b_lo)
+    dmap0_22 = prob.compute_work_diff_map(seed_rho0, active_mask=prob.train, B_smooth=b_hi)
+    pre_s0 = (cs_s0 if use_scale_joint else np.zeros(0, dtype=np.float64), seed_rho0, dmap0_8, dmap0_22)
 
     best_hp = tuple(hp_grid[0])
     best_hp_rval = float('inf')
+    best_hp_state = None
     val_trace = []
 
     for z_t, l1_w in hp_grid:
-        _, inf = fit_scale_divot_peak_given_hp(
+        _, inf, st_cur = fit_scale_divot_peak_given_hp(
             prob, cgrid, base_3d, open_mask_3d, active_mask=prob.train,
             fitreso_s=fitreso_s, use_divots=use_divots, use_peaks=use_peaks,
             z_thresh=z_t, lam_l1=l1_w, n_passes=n_passes, max_peaks_per_pass=120,
-            maxiter_s0=45, maxiter_joint=95
+            maxiter_s0=45, maxiter_joint=85, precomputed_s0=pre_s0, return_state=True,
+            use_scale=use_scale_joint,
         )
         val_trace.append((z_t, l1_w, inf['r_train'], inf['r_val'], inf['n_divots_act'], inf['n_peaks_act']))
         score_val = inf['r_val'] if math.isfinite(inf['r_val']) else inf['r_train']
         if score_val < best_hp_rval:
             best_hp_rval = score_val
             best_hp = (z_t, l1_w)
+            best_hp_state = st_cur
 
     if gate_on_val and np.any(prob.val):
         best_stage = 'base'
-        best_rval = float(rval_base)
-        if rval_scale < best_rval - float(min_rval_gain):
+        best_rval = float(rval_gate_ref)
+        if rval_scale < best_rval - min_gain:
             best_stage = 'scale_only'
             best_rval = float(rval_scale)
-        if best_hp_rval < best_rval - float(min_rval_gain):
+        if best_hp_rval < best_rval - min_gain:
             best_stage = 'divot_peak'
             best_rval = float(best_hp_rval)
     else:
@@ -1328,26 +1510,43 @@ def fit_adaptive_divot_peak_blind(prob: SolventAmplitudeProblem, cgrid: CrystalG
             'r_val': float(best_rval),
         }
     elif best_stage == 'scale_only':
-        rho_final, info_final = fit_scale_divot_peak_given_hp(
-            prob, cgrid, base_3d, open_mask_3d, active_mask=prob.work,
-            fitreso_s=fitreso_s, use_divots=False, use_peaks=False,
-            z_thresh=9.9, lam_l1=1e-3, n_passes=0, maxiter_s0=60, maxiter_joint=1
-        )
-        info_final['selected_stage'] = 'scale_only'
-        info_final['r_val'] = float(best_rval)
+        def obj_s0_wk(cs):
+            rho_s, _, _, pb_s = pf_s0.forward_and_pullback(cs, compute_grad=True)
+            ev = prob.eval_rho(rho_s, active_mask=prob.work, compute_grad=True)
+            return ev['loss'] + rs_eff * float(cs @ cs), pb_s(ev['grho']) + 2.0 * rs_eff * cs
+
+        res_wk = minimize(obj_s0_wk, cs_s0, method='L-BFGS-B', jac=True,
+                          bounds=[(-2.5, 2.5)] * pf_s0.nx, options={'maxiter': 25, 'ftol': 1e-10})
+        rho_final = supp_mask * softplus_pos(pf_s0.forward_and_pullback(res_wk.x, compute_grad=False)[0], tau=0.012)[0]
+        ev_w = prob.eval_rho(rho_final, active_mask=prob.work, compute_grad=False)
+        info_final = {
+            'selected_stage': 'scale_only',
+            'z_thresh': None,
+            'lam_l1': None,
+            'n_divots_tot': 0,
+            'n_divots_act': 0,
+            'n_peaks_tot': 0,
+            'n_peaks_act': 0,
+            'r_train': ev_w['r_train'],
+            'r_val': float(best_rval),
+        }
     else:
         rho_final, info_final = fit_scale_divot_peak_given_hp(
             prob, cgrid, base_3d, open_mask_3d, active_mask=prob.work,
             fitreso_s=fitreso_s, use_divots=use_divots, use_peaks=use_peaks,
-            z_thresh=best_hp[0], lam_l1=best_hp[1], n_passes=n_passes, max_peaks_per_pass=130,
-            maxiter_s0=60, maxiter_joint=140
+            z_thresh=best_hp[0], lam_l1=best_hp[1], n_passes=n_passes, max_peaks_per_pass=120,
+            maxiter_s0=30, maxiter_joint=35, warm_state=best_hp_state,
+            use_scale=use_scale_joint,
         )
         info_final['selected_stage'] = 'divot_peak'
         info_final['r_val'] = float(best_rval)
 
+    info_final['use_scale_joint'] = bool(use_scale_joint)
+    info_final['r_val_fmodel_in'] = float(rval_fmodel_in)
     info_final['r_val_base'] = float(rval_base)
     info_final['r_val_scale'] = float(rval_scale)
     info_final['r_val_best_hp'] = float(best_hp_rval)
+    info_final['min_rval_gain_used'] = float(min_gain)
     info_final['dt_s'] = round(time.time() - t0, 1)
     info_final['val_trace'] = val_trace
     return rho_final, info_final

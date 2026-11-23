@@ -9,7 +9,10 @@ from .field import (
     ASUGrid, DatasetBundle, WaterFieldSpec, load_ensemble, build_asu_features,
     forward_and_grad, smoothness_penalty_and_grad, param_bounds
 )
-from .io import choose_sg_grid_shape, resolve_crystal_symmetry, save_spec_and_theta
+from .io import (
+    choose_sg_grid_shape, resolve_crystal_symmetry, read_ccp4_map_checked,
+    check_crystal_compatibility, _sample_structure_for_target, save_spec_and_theta,
+)
 
 
 def _fourier_resample_3d(arr_3d: np.ndarray, new_shape) -> np.ndarray:
@@ -35,13 +38,7 @@ def _fourier_resample_3d(arr_3d: np.ndarray, new_shape) -> np.ndarray:
 
 def load_ccp4_map_and_grid(map_path: str, step: int = 2):
     """Read a CCP4 solvent electron-density map (in `e/A^3`) and construct its symmetry-exact `ASUGrid`."""
-    m = gemmi.read_ccp4_map(map_path, setup=True)
-    full_arr = np.array(m.grid, copy=True)
-    cell, sg = resolve_crystal_symmetry(
-        m.grid.unit_cell,
-        m.grid.spacegroup.hm if m.grid.spacegroup is not None else "",
-        source_desc=str(map_path),
-    )
+    full_arr, cell, sg, _ = read_ccp4_map_checked(map_path)
     step = int(step)
     try:
         grid = ASUGrid(cell, sg, full_arr.shape, step=step)
@@ -65,7 +62,7 @@ def load_ccp4_map_and_grid(map_path: str, step: int = 2):
 
 
 def fit_surfnturf_model(datasets_spec, loss_mode: str = "l2", n_types: int = 10,
-                        use_lp: bool = True, use_tet_oz: bool = True, n_oz_steps: int = 4,
+                        use_lp: bool = True, use_tet_oz: bool = True, n_oz_steps: int = None,
                         use_epol: bool = False, use_pauli_cap: bool = True, zero_bulk_offset: bool = True,
                         use_langmuir: bool = True, use_oz: bool = True, use_hpol: bool = True,
                         use_blur: bool = True, fit_box_scale: bool = True, step: int = 2,
@@ -82,11 +79,16 @@ def fit_surfnturf_model(datasets_spec, loss_mode: str = "l2", n_types: int = 10,
     use_lp_eff = bool(use_lp) and (not two_type)
     eff_n_types = 2 if two_type else (13 if use_lp_eff else 10)
     use_tet_eff = bool(use_tet_oz) and bool(use_oz)
+    eff_oz_steps = (4 if use_tet_eff else 1) if n_oz_steps is None else int(n_oz_steps)
     use_epol_eff = bool(use_epol) and (not two_type)
 
     bundles = []
     for name, map_path, model_path, b_val in datasets_spec:
         grid, rho_sub = load_ccp4_map_and_grid(map_path, step=step)
+        st_mdl = _sample_structure_for_target(model_path)
+        if st_mdl.cell.is_crystal():
+            mdl_cell, mdl_sg = resolve_crystal_symmetry(st_mdl.cell, st_mdl.spacegroup_hm, source_desc=str(model_path))
+            check_crystal_compatibility(grid.cell, grid.sg, str(map_path), mdl_cell, mdl_sg, str(model_path))
         if use_epol_eff:
             members, wts, charges = load_ensemble(
                 model_path, nconf=nconf, two_type_heavy_only=two_type, return_weights=True,
@@ -115,7 +117,7 @@ def fit_surfnturf_model(datasets_spec, loss_mode: str = "l2", n_types: int = 10,
         n_types=eff_n_types, use_langmuir=bool(use_langmuir), use_oz=bool(use_oz),
         use_hpol=bool(use_hpol), use_blur=bool(use_blur), fit_box_scale=bool(fit_box_scale),
         n_datasets=len(bundles), use_lp=use_lp_eff, use_tet_oz=use_tet_eff,
-        n_oz_steps=int(n_oz_steps), use_epol=use_epol_eff,
+        n_oz_steps=eff_oz_steps, use_epol=use_epol_eff,
         use_pauli_cap=bool(use_pauli_cap), zero_bulk_offset=bool(zero_bulk_offset),
     )
     theta0 = spec.init_params()
@@ -142,7 +144,7 @@ def fit_surfnturf_model(datasets_spec, loss_mode: str = "l2", n_types: int = 10,
     spec_export = WaterFieldSpec(
         n_types=eff_n_types, use_langmuir=bool(use_langmuir), use_oz=bool(use_oz),
         use_hpol=bool(use_hpol), use_blur=bool(use_blur), fit_box_scale=False, n_datasets=1,
-        use_lp=use_lp_eff, use_tet_oz=use_tet_eff, n_oz_steps=int(n_oz_steps),
+        use_lp=use_lp_eff, use_tet_oz=use_tet_eff, n_oz_steps=eff_oz_steps,
         use_epol=use_epol_eff, use_pauli_cap=bool(use_pauli_cap), zero_bulk_offset=bool(zero_bulk_offset),
     )
     theta_export = res.x[:spec_export.n_params].copy()

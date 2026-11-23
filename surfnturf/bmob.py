@@ -29,7 +29,7 @@ from .field import (
     ASUGrid, WaterFieldSpec, DatasetBundle, RHO_BULK,
     R_MIN, DR, N_KNOTS, R_CUT, RH_MIN, DRH, N_HKNOTS, RH_CUT, ACCEPTOR_TYPES,
     _COMPACT_IONS, _LARGE_POLAR_IONS, _DEFAULT_CLASS_Q, _bspline_weights, _validate_ensemble_mode,
-    _compute_epol_additive_terms, _epol_features_from_additive,
+    _gemmi_chain_icode, _compute_epol_additive_terms, _epol_features_from_additive,
     softplus, classify_conformer_atoms, compute_pmf_density_with_pullback,
     solv_to_fpart, fpart_grad_to_asu, fit_kmask_per_bin,
     smoothness_penalty_and_grad, param_bounds
@@ -54,17 +54,17 @@ def _atom_biso_from_gemmi(a):
 
 
 def classify_conformer_atoms_with_bfac(atoms_list, two_type_heavy_only=False, use_lp=False, return_charges=False):
-    """Classify [(res_seq, res_name, atom_name, elem, xyz, biso), ...] -> (xyz, typ, biso[, q])."""
+    """Classify [(res_seq, res_name, atom_name, elem, xyz, biso[, chain, icode]), ...] -> (xyz, typ, biso[, q])."""
     if two_type_heavy_only:
         xyz, typ, biso = [], [], []
-        for _, _, _, el, pos, b in atoms_list:
-            el_u = el.upper()
+        for rec in atoms_list:
+            el_u = rec[3].strip().upper()
             if el_u in ('H', 'D'):
                 continue
-            xyz.append(pos)
+            xyz.append(rec[4])
             is_pol = (el_u in ('N', 'O') or el_u in _COMPACT_IONS or el_u in _LARGE_POLAR_IONS)
             typ.append(0 if is_pol else 1)
-            biso.append(float(np.clip(b, 0.5, 999.0)))
+            biso.append(float(np.clip(rec[5], 0.5, 999.0)))
         xyz_a = np.array(xyz, dtype=np.float64).reshape(-1, 3)
         typ_a = np.array(typ, dtype=np.int32)
         bi_a = np.array(biso, dtype=np.float64)
@@ -72,7 +72,7 @@ def classify_conformer_atoms_with_bfac(atoms_list, two_type_heavy_only=False, us
             return xyz_a, typ_a, bi_a, np.zeros(len(typ_a), dtype=np.float64)
         return xyz_a, typ_a, bi_a
 
-    stripped = [rec[:5] for rec in atoms_list]
+    stripped = [rec[:5] + rec[6:8] for rec in atoms_list]
     heavy_b = [float(np.clip(rec[5], 0.5, 999.0)) for rec in atoms_list if rec[3].strip().upper() not in ('H', 'D')]
     hyd_b = [float(np.clip(rec[5], 0.5, 999.0)) for rec in atoms_list if rec[3].strip().upper() in ('H', 'D')]
     real_biso = np.array(heavy_b + hyd_b, dtype=np.float64)
@@ -134,14 +134,16 @@ def load_ensemble_with_bfac(path_or_dir, nconf=32, two_type_heavy_only=False, mo
         for f in files:
             st = gemmi.read_structure(f)
             al = []
-            for ch in st[0]:
+            for ch_idx, ch in enumerate(st[0]):
                 for r in ch:
                     if r.name in ('HOH', 'WAT', 'DOD'):
                         continue
+                    ch_tag, ic_tag = _gemmi_chain_icode(ch_idx, ch, r)
                     for a in r:
                         if a.occ <= 0:
                             continue
-                        al.append((r.seqid.num, r.name, a.name, a.element.name, a.pos.tolist(), _atom_biso_from_gemmi(a)))
+                        al.append((r.seqid.num, r.name, a.name, a.element.name, a.pos.tolist(),
+                                   _atom_biso_from_gemmi(a), ch_tag, ic_tag))
             raw_lists.append(al)
         wts = np.full(len(raw_lists), 1.0 / max(len(raw_lists), 1), dtype=np.float64)
         return _finish(raw_lists, wts)
@@ -152,10 +154,11 @@ def load_ensemble_with_bfac(path_or_dir, nconf=32, two_type_heavy_only=False, mo
         al = []
         matched_alt = 0
         seen_alts = set()
-        for ch in st[0]:
+        for ch_idx, ch in enumerate(st[0]):
             for r in ch:
                 if r.name in ('HOH', 'WAT', 'DOD'):
                     continue
+                ch_tag, ic_tag = _gemmi_chain_icode(ch_idx, ch, r)
                 for a in r:
                     if a.occ <= 0:
                         continue
@@ -165,7 +168,8 @@ def load_ensemble_with_bfac(path_or_dir, nconf=32, two_type_heavy_only=False, mo
                     if not alt_s or alt_s == alt:
                         if alt_s == alt:
                             matched_alt += 1
-                        al.append((r.seqid.num, r.name, a.name, a.element.name, a.pos.tolist(), _atom_biso_from_gemmi(a)))
+                        al.append((r.seqid.num, r.name, a.name, a.element.name, a.pos.tolist(),
+                                   _atom_biso_from_gemmi(a), ch_tag, ic_tag))
         if matched_alt == 0 and seen_alts:
             print(
                 f"surfnturf: altloc {alt!r} not found in {path_or_dir} (available: {sorted(seen_alts)}); "
@@ -179,6 +183,8 @@ def load_ensemble_with_bfac(path_or_dir, nconf=32, two_type_heavy_only=False, mo
     all_alts = set()
     any_h_split_on_blank_hv = False
     n_pos_hv = 0
+    split_res_sets = []
+    split_q_first = []
     for ch in st[0]:
         for r in ch:
             if r.name in ('HOH', 'WAT', 'DOD'):
@@ -186,6 +192,7 @@ def load_ensemble_with_bfac(path_or_dir, nconf=32, two_type_heavy_only=False, mo
             r_blank_hv = False
             r_alt_hv = False
             r_alt_h_letters = set()
+            r_hv_by_alt = {}
             for a in r:
                 is_h = a.element.name in ('H', 'D')
                 alt_s = a.altloc.strip() if a.altloc != '\0' else ''
@@ -194,12 +201,19 @@ def load_ensemble_with_bfac(path_or_dir, nconf=32, two_type_heavy_only=False, mo
                     if alt_s:
                         all_alts.add(alt_s)
                         r_alt_hv = True
+                        r_hv_by_alt.setdefault(alt_s, []).append(float(a.occ))
                     else:
                         r_blank_hv = True
                 elif is_h and a.occ > 0 and alt_s:
                     r_alt_h_letters.add(alt_s)
                 elif not is_h and alt_s:
                     r_alt_hv = True
+            if r_hv_by_alt:
+                split_res_sets.append(set(r_hv_by_alt.keys()))
+                l0 = sorted(r_hv_by_alt.keys())[0]
+                tot_q = sum(float(np.mean(v)) for v in r_hv_by_alt.values())
+                if tot_q > 1e-6:
+                    split_q_first.append((l0, float(np.mean(r_hv_by_alt[l0])) / tot_q))
             if r_blank_hv and not r_alt_hv and r_alt_h_letters:
                 any_h_split_on_blank_hv = True
                 all_alts.update(r_alt_h_letters)
@@ -209,30 +223,41 @@ def load_ensemble_with_bfac(path_or_dir, nconf=32, two_type_heavy_only=False, mo
 
     if not all_alts and not any_h_split_on_blank_hv:
         al = []
-        for ch in st[0]:
+        for ch_idx, ch in enumerate(st[0]):
             for r in ch:
                 if r.name in ('HOH', 'WAT', 'DOD'):
                     continue
+                ch_tag, ic_tag = _gemmi_chain_icode(ch_idx, ch, r)
                 for a in r:
                     if a.occ > 0:
-                        al.append((r.seqid.num, r.name, a.name, a.element.name, a.pos.tolist(), _atom_biso_from_gemmi(a)))
+                        al.append((r.seqid.num, r.name, a.name, a.element.name, a.pos.tolist(),
+                                   _atom_biso_from_gemmi(a), ch_tag, ic_tag))
         return _finish([al], np.array([1.0], dtype=np.float64))
 
-    use_letters = (mode == 'letters') or (mode == 'auto' and all_alts.issubset({'A', 'B'}))
+    first_alt = sorted(all_alts)[0] if all_alts else ''
+    q_first_vals = [qf for (l0, qf) in split_q_first if l0 == first_alt]
+    letters_auto_safe = (
+        all_alts.issubset({'A', 'B'})
+        and all(s == all_alts for s in split_res_sets)
+        and (len(q_first_vals) <= 1 or (max(q_first_vals) - min(q_first_vals)) <= 0.08)
+    )
+    use_letters = (mode == 'letters') or (mode == 'auto' and letters_auto_safe)
     if use_letters:
         letters = sorted(all_alts)
         mem_lists = {L: [] for L in letters}
         occ_lists = {L: [] for L in letters}
-        for ch in st[0]:
+        for ch_idx, ch in enumerate(st[0]):
             for r in ch:
                 if r.name in ('HOH', 'WAT', 'DOD'):
                     continue
+                ch_tag, ic_tag = _gemmi_chain_icode(ch_idx, ch, r)
                 blank_atoms = []
                 blank_hv = False
                 any_alt_hv = False
                 by_alt_raw = {}
                 for a in r:
-                    rec = (r.seqid.num, r.name, a.name, a.element.name, a.pos.tolist(), _atom_biso_from_gemmi(a))
+                    rec = (r.seqid.num, r.name, a.name, a.element.name, a.pos.tolist(),
+                           _atom_biso_from_gemmi(a), ch_tag, ic_tag)
                     alt_s = a.altloc.strip() if a.altloc != '\0' else ''
                     is_h = a.element.name in ('H', 'D')
                     if not alt_s:
@@ -269,7 +294,8 @@ def load_ensemble_with_bfac(path_or_dir, nconf=32, two_type_heavy_only=False, mo
             path_or_dir, nconf=nconf, occ_flex=occ_flex, quotas='hamilton', rebuild_h=True, add_missing_h=True
         )
         raw_lists = [
-            [(a['seqnum'], a['resname'], a['name'], a['elem'], list(a['pos']), float(np.clip(a['biso'], 0.5, 999.0)))
+            [(a['seqnum'], a['resname'], a['name'], a['elem'], list(a['pos']),
+              float(np.clip(a['biso'], 0.5, 999.0)), str(a.get('chain', '')).strip(), str(a.get('icode', '')).strip())
              for a in c]
             for c in confs
         ]
@@ -278,36 +304,38 @@ def load_ensemble_with_bfac(path_or_dir, nconf=32, two_type_heavy_only=False, mo
 
     quantiles = (np.arange(nconf, dtype=np.float64) + 0.5) / nconf
     mem_recs = [[] for _ in range(nconf)]
-    for ch in st[0]:
+    for ch_idx, ch in enumerate(st[0]):
         for r in ch:
             if r.name in ('HOH', 'WAT', 'DOD'):
                 continue
+            ch_tag, ic_tag = _gemmi_chain_icode(ch_idx, ch, r)
             blank_atoms = []
             blank_hv = False
             any_alt_hv = False
             by_alt_raw = {}
             for a in r:
-                rec = (r.seqid.num, r.name, a.name, a.element.name, a.pos.tolist(), _atom_biso_from_gemmi(a), a.occ)
+                rec8 = (r.seqid.num, r.name, a.name, a.element.name, a.pos.tolist(),
+                        _atom_biso_from_gemmi(a), ch_tag, ic_tag)
                 if a.altloc == '\0' or not a.altloc.strip():
                     if a.occ > 0:
-                        blank_atoms.append(rec[:6])
+                        blank_atoms.append(rec8)
                         if a.element.name not in ('H', 'D'):
                             blank_hv = True
                 else:
                     if a.element.name not in ('H', 'D'):
                         any_alt_hv = True
-                    by_alt_raw.setdefault(a.altloc.strip(), []).append(rec)
+                    by_alt_raw.setdefault(a.altloc.strip(), []).append((rec8, a.occ))
             by_alt = {}
             hv_weights = {}
             for L, recs in by_alt_raw.items():
-                hv_occs = [x[6] for x in recs if x[3] not in ('H', 'D') and x[6] > 0]
+                hv_occs = [occ for (r8, occ) in recs if r8[3] not in ('H', 'D') and occ > 0]
                 if hv_occs:
-                    by_alt[L] = [x[:6] for x in recs if x[6] > 0 or x[3] in ('H', 'D')]
+                    by_alt[L] = [r8 for (r8, occ) in recs if occ > 0 or r8[3] in ('H', 'D')]
                     hv_weights[L] = float(np.mean(hv_occs))
                 elif blank_hv and not any_alt_hv:
-                    h_occs = [x[6] for x in recs if x[6] > 0]
+                    h_occs = [occ for (_, occ) in recs if occ > 0]
                     if h_occs:
-                        by_alt[L] = [x[:6] for x in recs if x[6] > 0]
+                        by_alt[L] = [r8 for (r8, occ) in recs if occ > 0]
                         hv_weights[L] = float(np.mean(h_occs))
             if not by_alt:
                 for m in range(nconf):
@@ -375,7 +403,7 @@ def build_mobility_features(grid: ASUGrid, members, members_biso, two_type_heavy
         hv_pol = pol_types[hv_mask]
         mean_b = float(np.mean(hv_b)) if len(hv_b) else 12.0
 
-        SX, Si = grid.sym_expand(hv_xyz, cutoff_A=5.3)
+        SX, Si = grid.sym_expand(hv_xyz, cutoff_A=5.3, dedup_self=True)
         if len(SX) == 0:
             B_prot[m] = mean_b
             B_prot_tb32[m] = mean_b
@@ -447,11 +475,13 @@ class SlimDatasetBundle:
         self.Phi_H_flat = None
 
 
-def fast_build_asu_and_mobility(grid: ASUGrid, members, members_biso, n_types=10, include_hpol=True,
+def fast_build_asu_and_mobility(grid: ASUGrid, members, members_biso, n_types=None, include_hpol=True,
                                 include_tet_oz=False, include_epol=False, charges=None,
                                 member_weights=None, return_extra=False, max_workers=8):
     """Build `(Phi_O, Phi_H, steric_H, MobilityFeatures[, extra])` ~50x faster via `cKDTree(asu_xyz)`."""
     M = len(members)
+    if n_types is None:
+        n_types = 13 if any(len(t) > 0 and np.any(t >= 10) for _, t in members) else 10
     n_asu = grid.n_asu
     pts = grid.asu_xyz
     n_feat = int(n_types) * N_KNOTS
@@ -481,7 +511,7 @@ def fast_build_asu_and_mobility(grid: ASUGrid, members, members_biso, n_types=10
         else:
             xyz_use, typ_use, biso_use = xyz, typ, biso
 
-        SX, Si = grid.sym_expand(xyz_use, cutoff_A=R_CUT)
+        SX, Si = grid.sym_expand(xyz_use, cutoff_A=R_CUT, dedup_self=True)
         St = typ_use[Si]
         Sb = biso_use[Si]
         nb_a = tree_pts.query_ball_point(SX, R_CUT) if len(SX) else []
@@ -536,7 +566,7 @@ def fast_build_asu_and_mobility(grid: ASUGrid, members, members_biso, n_types=10
         if include_tet_oz and len(xyz_r) > 0:
             pol_hv = (typ_r == 0) if two_type else ((typ_r == 0) | (typ_r == 1) | (typ_r == 2) | (typ_r == 3))
             if np.any(pol_hv):
-                SP, _ = grid.sym_expand(xyz_r[pol_hv], cutoff_A=1.8)
+                SP, _ = grid.sym_expand(xyz_r[pol_hv], cutoff_A=1.8, dedup_self=True)
                 if len(SP) > 0:
                     nb_p = tree_pts.query_ball_point(SP, 1.5)
                     lp = np.array([len(x) for x in nb_p], dtype=np.int32)
@@ -569,7 +599,7 @@ def fast_build_asu_and_mobility(grid: ASUGrid, members, members_biso, n_types=10
 
         hv_xyz = xyz_use[hv_atom]
         hv_b = biso_use[hv_atom]
-        SX_hv, Si_hv = grid.sym_expand(hv_xyz, cutoff_A=5.3)
+        SX_hv, Si_hv = grid.sym_expand(hv_xyz, cutoff_A=5.3, dedup_self=True)
         if len(SX_hv) == 0:
             mean_b = float(np.mean(hv_b)) if len(hv_b) else 12.0
             B_prot[m] = mean_b
@@ -944,33 +974,61 @@ def free_mask_from_flags(flags, valid, free_flag_value=None, source_desc="R-free
     """Return the test-set mask from an R-free flag column.
 
     `free_flag_value` given: test = flags == value. Otherwise 0/1 flags take the minority value as test (phenix
-    writes test = 1, but a 0/1 file with test = 0 is also read correctly), and multi-valued 0..N-1 flags take 0
-    (CCP4 convention; pass `free_flag_value` for files that mark test with another value).
+    writes test = 1, but a 0/1 file with test = 0 is also read correctly), SHELX -1/1 flags take -1 as test, and
+    multi-valued 0..N-1 flags take 0 (CCP4 convention; pass `free_flag_value` for files marking test with another value).
     """
     fl = np.asarray(flags, dtype=np.float64)
     ok = np.asarray(valid, dtype=bool) & np.isfinite(fl)
-    fl_i = np.where(np.isfinite(fl), np.round(fl), -1).astype(np.int64)
-    if free_flag_value is not None:
-        return ok & (fl_i == int(free_flag_value))
-    vals, counts = np.unique(fl_i[ok], return_counts=True)
-    if len(vals) == 0:
+    fl_i = np.where(np.isfinite(fl), np.round(fl), -999999).astype(np.int64)
+    n_ok = int(np.sum(ok))
+    if n_ok == 0:
         return np.zeros(len(fl_i), dtype=bool)
-    if set(vals.tolist()).issubset({0, 1}) and len(vals) == 2:
+    vals, counts = np.unique(fl_i[ok], return_counts=True)
+
+    if free_flag_value is not None:
+        mask = ok & (fl_i == int(free_flag_value))
+        if not np.any(mask):
+            print(
+                f"surfnturf warning: {source_desc}: no reflections match free_flag_value={int(free_flag_value)} "
+                f"(present values: {vals.tolist()[:10]}); R-free test set is empty",
+                file=sys.stderr,
+            )
+        return mask
+
+    if len(vals) == 1:
+        print(f"surfnturf warning: {source_desc}: all flags equal {int(vals[0])}; R-free test set is empty", file=sys.stderr)
+        return np.zeros(len(fl_i), dtype=bool)
+
+    val_set = set(vals.tolist())
+    if val_set == {0, 1}:
         test_val = int(vals[int(np.argmin(counts))])
         if counts[0] == counts[1]:
             test_val = 1
         if test_val == 0:
             print(f"surfnturf: {source_desc}: 0/1 flags with 0 in the minority; treating flag 0 as the test set",
                   file=sys.stderr)
-        return ok & (fl_i == test_val)
-    if len(vals) == 1:
-        print(f"surfnturf: {source_desc}: all flags equal {int(vals[0])}; no test set", file=sys.stderr)
-        return np.zeros(len(fl_i), dtype=bool)
-    frac0 = float(np.mean(fl_i[ok] == 0))
-    if frac0 > 0.5:
-        print(f"surfnturf: {source_desc}: {100 * frac0:.0f}% of reflections have flag 0, which would be the test "
-              f"set under the CCP4 convention; pass the test-set flag value explicitly", file=sys.stderr)
-    return ok & (fl_i == 0)
+        mask = ok & (fl_i == test_val)
+    elif val_set == {-1, 1}:
+        print(f"surfnturf: {source_desc}: SHELX -1/1 flags detected; treating flag -1 as the test set", file=sys.stderr)
+        mask = ok & (fl_i == -1)
+    else:
+        mask = ok & (fl_i == 0)
+        if not np.any(mask):
+            print(
+                f"surfnturf warning: {source_desc}: flag value 0 is absent (present values: {vals.tolist()[:10]}); "
+                f"R-free test set is empty — pass --free-flag-value explicitly",
+                file=sys.stderr,
+            )
+            return mask
+
+    frac = float(np.sum(mask)) / float(n_ok)
+    if n_ok >= 50 and not (0.005 <= frac <= 0.35):
+        print(
+            f"surfnturf warning: {source_desc}: R-free test set covers {100.0 * frac:.1f}% of reflections "
+            f"(expected ~1-30%); pass --free-flag-value if another flag marks the test set",
+            file=sys.stderr,
+        )
+    return mask
 
 
 def canonical_hkl_keys(hkl, spacegroup=None):
@@ -1075,7 +1133,7 @@ class ReciprocalTarget:
     """Holds work/train/val/free reflections, fixed atomic F_calc, Phenix k_total, and bins for |Fo| fitting."""
 
     def __init__(self, hkl, f_obs, work_mask, free_mask, f_calc, k_tot, bin_idx, n_bins, d_hkl,
-                 train_mask=None, val_mask=None, f_model_ref=None):
+                 train_mask=None, val_mask=None, f_model_ref=None, spacegroup=None):
         self.hkl = np.ascontiguousarray(hkl, dtype=np.int64)
         self.f_obs = np.ascontiguousarray(f_obs, dtype=np.float64)
         self.work_mask = np.asarray(work_mask, dtype=bool)
@@ -1086,8 +1144,9 @@ class ReciprocalTarget:
         self.bin_idx = np.ascontiguousarray(bin_idx, dtype=np.int32)
         self.n_bins = int(n_bins)
         self.d_hkl = np.ascontiguousarray(d_hkl, dtype=np.float64)
+        self.spacegroup = spacegroup
         if train_mask is None or val_mask is None:
-            tr_m, vl_m = make_work_train_val_split(self.hkl, self.d_hkl, self.free_mask)
+            tr_m, vl_m = make_work_train_val_split(self.hkl, self.d_hkl, self.free_mask, spacegroup=spacegroup)
             self.train_mask = tr_m & self.work_mask
             self.val_mask = vl_m & (~self.free_mask)
         else:
@@ -1105,7 +1164,90 @@ class ReciprocalTarget:
             hkl=self.hkl, f_obs=self.f_obs, work_mask=use_tr, free_mask=self.free_mask,
             f_calc=self.f_calc, k_tot=self.k_tot, bin_idx=self.bin_idx, n_bins=self.n_bins,
             d_hkl=self.d_hkl, train_mask=use_tr, val_mask=self.val_mask, f_model_ref=self.f_model_ref,
+            spacegroup=self.spacegroup,
         )
+
+    def _solve_global_scalar_k0_kb(self, f_part, sel_mask, kb_bounds=(0.65, 1.50), k0_bounds=(0.50, 1.50)):
+        """Solve min_{k0, kb} 0.5 * sum((|k0 * k_tot * (f_calc + kb * f_part)| - f_obs)^2) on `sel_mask`.
+
+        For any trial mother-liquor density ratio `kb = rho_mother / rho_water` in `kb_bounds` (0.65..1.50 ->
+        0.22..0.50 e/A^3, spanning detergent belts to concentrated sulfate/salt mother liquors), optimal `k0*(kb)`
+        has exact closed form, reducing the 2D scale problem to a deterministic 1D bounded scalar minimization with
+        zero resolution-shell B-factor degeneracy against B(x).
+        """
+        from scipy.optimize import minimize_scalar
+
+        if not np.any(sel_mask):
+            return 1.0, 1.0
+        C = self.k_tot[sel_mask] * self.f_calc[sel_mask]
+        P = self.k_tot[sel_mask] * f_part[sel_mask]
+        Fo = self.f_obs[sel_mask]
+        a2 = np.real(C) ** 2 + np.imag(C) ** 2
+        p2 = np.real(P) ** 2 + np.imag(P) ** 2
+        if float(np.sum(p2)) <= 1e-20:
+            au0 = np.sqrt(a2)
+            d0 = max(float(np.sum(a2)), 1e-12)
+            k0 = float(np.clip(float(np.dot(au0, Fo)) / d0, k0_bounds[0], k0_bounds[1]))
+            return k0, 1.0
+        cp = 2.0 * (np.real(C) * np.real(P) + np.imag(C) * np.imag(P))
+        fo2 = float(np.dot(Fo, Fo))
+        k0_lo, k0_hi = float(k0_bounds[0]), float(k0_bounds[1])
+        kb_lo, kb_hi = float(kb_bounds[0]), float(kb_bounds[1])
+
+        def _eval_kb(kb):
+            u2 = np.maximum(a2 + kb * (cp + kb * p2), 0.0)
+            au = np.sqrt(u2)
+            d = max(float(np.sum(u2)), 1e-12)
+            dot_af = float(np.dot(au, Fo))
+            k0 = float(np.clip(dot_af / d, k0_lo, k0_hi))
+            r = k0 * au - Fo
+            return float(np.dot(r, r)), k0
+
+        grid_kb = np.linspace(kb_lo, kb_hi, 9)
+        grid_vals = [_eval_kb(float(g))[0] for g in grid_kb]
+        ib = int(np.argmin(grid_vals))
+        step = (kb_hi - kb_lo) / 8.0
+        br_lo = max(kb_lo, float(grid_kb[ib]) - step)
+        br_hi = min(kb_hi, float(grid_kb[ib]) + step)
+        res_1d = minimize_scalar(lambda x: _eval_kb(float(x))[0], bounds=(br_lo, br_hi),
+                                 method='bounded', options={'xatol': 1e-12})
+        kb_star = float(np.clip(res_1d.x, kb_lo, kb_hi))
+        cur_sse, k0_star = _eval_kb(kb_star)
+
+        # Polish (k0, kb) with 6 exact 2x2 projected Newton steps (including phase curvature) to 1e-15 stationarity
+        lo2 = np.array([k0_lo, kb_lo], dtype=np.float64)
+        hi2 = np.array([k0_hi, kb_hi], dtype=np.float64)
+        qv = np.array([k0_star, kb_star], dtype=np.float64)
+        for _ in range(8):
+            k0_c, kb_c = float(qv[0]), float(qv[1])
+            U = C + kb_c * P
+            u = np.maximum(np.abs(U), 1e-12)
+            e = U / u
+            r = k0_c * u - Fo
+            p_par = np.real(np.conj(e) * P)
+            p_perp2 = np.maximum(p2 - p_par * p_par, 0.0)
+            g = np.array([float(np.dot(r, u)), k0_c * float(np.dot(r, p_par))], dtype=np.float64)
+            free_c = np.ones(2, dtype=bool)
+            for c in range(2):
+                if (qv[c] <= lo2[c] + 1e-13 and g[c] >= 0.0) or (qv[c] >= hi2[c] - 1e-13 and g[c] <= 0.0):
+                    free_c[c] = False
+            if not np.any(free_c) or float(np.max(np.abs(g[free_c]))) < 1e-13:
+                break
+            h00 = float(np.dot(u, u))
+            h01 = float(np.dot(2.0 * k0_c * u - Fo, p_par))
+            h11 = (k0_c * k0_c) * float(np.dot(p_par, p_par)) + k0_c * float(np.dot(r, p_perp2 / u))
+            H2 = np.array([[h00, h01], [h01, max(h11, 1e-8)]], dtype=np.float64)
+            Hf = H2[np.ix_(free_c, free_c)]
+            dq = np.zeros(2, dtype=np.float64)
+            dq[free_c] = -np.linalg.solve(Hf + 1e-14 * np.eye(len(Hf)), g[free_c])
+            for alpha in (1.0, 0.5, 0.25, 0.1):
+                q_try = np.clip(qv + alpha * dq, lo2, hi2)
+                r_try = float(q_try[0]) * np.abs(C + float(q_try[1]) * P) - Fo
+                s_try = float(np.dot(r_try, r_try))
+                if s_try <= cur_sse + 1e-15 * cur_sse:
+                    qv, cur_sse = q_try, s_try
+                    break
+        return float(qv[0]), float(qv[1])
 
     def eval_blind_rval(self, f_part, kmask_mode: str = 'per_bin', k_bounds=(0.0, 3.0)):
         """Fit solvent scales strictly on `train_mask` and return `(r_train, r_val, r_work, r_free)`."""
@@ -1120,6 +1262,9 @@ class ReciprocalTarget:
             denom = float(np.sum(au[tr] ** 2))
             k0 = float(np.sum(au[tr] * self.f_obs[tr]) / max(denom, 1e-12))
             afm = np.abs(k0 * u_tot)
+        elif kmask_mode == 'global_scalar':
+            k0, kb = self._solve_global_scalar_k0_kb(f_part, tr)
+            afm = np.abs(k0 * self.k_tot * (self.f_calc + kb * f_part))
         else:
             _, k_hkl = fit_kmask_per_bin(
                 self.f_calc, f_part, self.k_tot, self.f_obs, tr,
@@ -1134,7 +1279,7 @@ class ReciprocalTarget:
         return _r(tr), _r(vl), _r(wk), _r(fr)
 
     def eval_fmodel_ref_rval(self) -> float:
-        """Evaluate the input `*_f_model.mtz` amplitude agreement on unseen `val_mask`."""
+        """Evaluate the input `*_f_model.mtz` amplitude agreement on `val_mask` (unblind reference fit to full `work`)."""
         if self.f_model_ref is None or not np.any(self.val_mask):
             return float('nan')
         denom = float(np.sum(self.f_obs[self.val_mask]))
@@ -1161,6 +1306,18 @@ class ReciprocalTarget:
             r_work = float(np.sum(np.abs(res[w])) / max(self.work_fo_sum, 1e-12))
             r_free = float(np.sum(np.abs(res[fr])) / self.free_fo_sum) if np.any(fr) and self.free_fo_sum > 0 else float('nan')
             return loss, dL_dF, r_work, r_free, np.full(self.n_bins, 1.0, dtype=np.float64)
+
+        if kmask_mode == 'global_scalar':
+            k0, kb = self._solve_global_scalar_k0_kb(f_part, w)
+            fm = k0 * self.k_tot * (self.f_calc + kb * f_part)
+            afm = np.maximum(np.abs(fm), 1e-12)
+            res = afm - self.f_obs
+            loss = 0.5 * float(np.sum(res[w] ** 2)) * inv_norm
+            dL_dF = np.zeros_like(f_part, dtype=np.complex128)
+            dL_dF[w] = (res[w] * inv_norm) * (k0 * kb * self.k_tot[w]) * (fm[w] / afm[w])
+            r_work = float(np.sum(np.abs(res[w])) / max(self.work_fo_sum, 1e-12))
+            r_free = float(np.sum(np.abs(res[fr])) / self.free_fo_sum) if np.any(fr) and self.free_fo_sum > 0 else float('nan')
+            return loss, dL_dF, r_work, r_free, np.full(self.n_bins, kb, dtype=np.float64)
 
         k_bins, k_hkl = fit_kmask_per_bin(
             self.f_calc, f_part, self.k_tot, self.f_obs, w,
@@ -1230,6 +1387,7 @@ def multiB_fpart_loss_and_grad(
         return {
             'loss': loss, 'r_work': r_work, 'r_free': r_free,
             'solv_3d': solv_3d, 'f_part': f_part, 'B_eff_asu': B_eff_asu, 'k_bins': k_bins,
+            'g_hat_unmasked': g_hat,
         }
 
     dL_dg_eff = fpart_grad_to_asu(grid, g_eff_asu, target.hkl, dL_dF, clamp_nonneg=clamp_nonneg)
@@ -1417,7 +1575,7 @@ def fit_bmob_blind_gated(renderer, target: ReciprocalTarget, ds, mob_feat, cache
     """Fit uniform, 6-param physical, and res-scaled spatial B(x) strictly on 90% `train_mask` and pick the blind `val_mask` winner.
 
     Keeping `target.val_mask` (5%) strictly unseen prevents spatial B(x) overfitting at low resolution
-    and preserves `val_mask` uncontaminated for any downstream `fit-divot` stage, without ever touching `FreeR_flag == 0`.
+    and preserves `val_mask` uncontaminated for any downstream `fit-divot` stage, without ever touching the R-free test set.
     """
     targ_tr = target.for_training_subset()
     z_b5 = np.full((1, ds.grid.n_asu), np.log(5.0), dtype=np.float64)
@@ -1596,12 +1754,12 @@ def load_reciprocal_target_from_fmodel_mtz(fmodel_mtz_path: str, n_bins: int = 2
     edges[-1] = np.inf
     bin_idx = np.clip(np.searchsorted(edges, inv_d3, side='right') - 1, 0, int(n_bins) - 1)
 
-    sg_raw = mtz.spacegroup
-    sg = (
-        gemmi.find_spacegroup_by_name(sg_raw.hm, alpha=mtz.cell.alpha, gamma=mtz.cell.gamma)
-        if sg_raw is not None
-        else gemmi.SpaceGroup("P 1")
-    ) or sg_raw or gemmi.SpaceGroup("P 1")
+    from .io import resolve_crystal_symmetry, check_crystal_compatibility
+    sg_hm = mtz.spacegroup.hm if mtz.spacegroup is not None else ""
+    cell, sg = resolve_crystal_symmetry(mtz.cell, sg_hm, source_desc=str(fmodel_mtz_path))
+    if data_mtz_path is not None and os.path.isfile(data_mtz_path):
+        dm_chk = gemmi.read_mtz_file(data_mtz_path)
+        check_crystal_compatibility(cell, sg, str(fmodel_mtz_path), dm_chk.cell, dm_chk.spacegroup, str(data_mtz_path))
 
     train_v, val_v = make_work_train_val_split(
         hkl[valid], d_hkl[valid], free_mask[valid],
@@ -1612,6 +1770,6 @@ def load_reciprocal_target_from_fmodel_mtz(fmodel_mtz_path: str, n_bins: int = 2
         work_mask=work_mask[valid], free_mask=free_mask[valid],
         f_calc=f_calc[valid], k_tot=k_tot[valid],
         bin_idx=bin_idx[valid], n_bins=int(n_bins), d_hkl=d_hkl[valid],
-        train_mask=train_v, val_mask=val_v, f_model_ref=f_model[valid],
+        train_mask=train_v, val_mask=val_v, f_model_ref=f_model[valid], spacegroup=sg,
     )
-    return target, mtz.cell, sg
+    return target, cell, sg

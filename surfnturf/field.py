@@ -105,28 +105,30 @@ SP2_CARBONS = {
 }
 
 _BACKBONE_Q = {
-    'N': -0.4157, 'H': 0.2719, 'HN': 0.2719, 'CA': 0.0337, 'HA': 0.0823,
+    'N': -0.4157, 'H': 0.2719, 'HN': 0.2719, 'CA': 0.0321, 'HA': 0.0823,
     'HA2': 0.0823, 'HA3': 0.0823, 'C': 0.5973, 'O': -0.5679, 'OXT': -0.7850,
-    'H1': 0.3100, 'H2': 0.3100, 'H3': 0.3100,
+    'H1': 0.3854, 'H2': 0.3854, 'H3': 0.3854,
 }
 
 _SIDECHAIN_Q = {
-    'ASP': {'CB': -0.0303, 'CG': 0.7994, 'OD1': -0.8014, 'OD2': -0.8014},
-    'GLU': {'CB': 0.0560, 'CG': 0.0136, 'CD': 0.8054, 'OE1': -0.8188, 'OE2': -0.8188},
-    'LYS': {'CE': -0.0143, 'NZ': -0.3854, 'HZ1': 0.3400, 'HZ2': 0.3400, 'HZ3': 0.3400},
-    'ARG': {'CD': 0.0486, 'NE': -0.5295, 'HE': 0.3456, 'CZ': 0.8076,
-            'NH1': -0.8627, 'HH11': 0.4478, 'HH12': 0.4478,
-            'NH2': -0.8627, 'HH21': 0.4478, 'HH22': 0.4478},
-    'ASN': {'CB': -0.2041, 'CG': 0.7130, 'OD1': -0.5931, 'ND2': -0.9191, 'HD21': 0.4196, 'HD22': 0.4196},
-    'GLN': {'CG': -0.0645, 'CD': 0.6951, 'OE1': -0.6086, 'NE2': -0.9407, 'HE21': 0.4251, 'HE22': 0.4251},
-    'SER': {'CB': 0.2117, 'OG': -0.6546, 'HG': 0.4275},
-    'THR': {'CB': 0.3654, 'OG1': -0.6761, 'HG1': 0.4102},
-    'TYR': {'CZ': 0.3226, 'OH': -0.5579, 'HH': 0.3992},
-    'TRP': {'NE1': -0.3418, 'HE1': 0.3412},
-    'CYS': {'CB': -0.1231, 'SG': -0.3119, 'HG': 0.1933},
-    'CYX': {'CB': -0.0790, 'SG': -0.1081},
-    'MET': {'CG': 0.0018, 'SD': -0.2737, 'CE': -0.0536},
-    'PRO': {'N': -0.2548, 'CD': 0.0192, 'CA': -0.0266, 'C': 0.5896, 'O': -0.5748},
+    'GLY': {'CA': -0.0502},
+    'ASP': {'CG': 0.6028, 'OD1': -0.8014, 'OD2': -0.8014},
+    'GLU': {'CD': 0.6376, 'OE1': -0.8188, 'OE2': -0.8188},
+    'LYS': {'NZ': -0.3800, 'HZ1': 0.4600, 'HZ2': 0.4600, 'HZ3': 0.4600},
+    'ARG': {'NE': -0.5300, 'HE': 0.3600, 'CZ': 0.8100,
+            'NH1': -0.8600, 'HH11': 0.5200, 'HH12': 0.5200,
+            'NH2': -0.8600, 'HH21': 0.5200, 'HH22': 0.5200},
+    'ASN': {'CG': 0.6730, 'OD1': -0.5930, 'ND2': -0.9200, 'HD21': 0.4200, 'HD22': 0.4200},
+    'GLN': {'CD': 0.6986, 'OE1': -0.6086, 'NE2': -0.9400, 'HE21': 0.4250, 'HE22': 0.4250},
+    'SER': {'CB': 0.1271, 'OG': -0.6546, 'HG': 0.4275},
+    'THR': {'CB': 0.2159, 'OG1': -0.6761, 'HG1': 0.4102},
+    'TYR': {'CZ': 0.1587, 'OH': -0.5579, 'HH': 0.3992},
+    'TRP': {'NE1': -0.3412, 'HE1': 0.3412},
+    'CYS': {'CB': 0.0186, 'SG': -0.3119, 'HG': 0.1933},
+    'CYX': {'CB': 0.0081, 'SG': -0.1081},
+    'MET': {'CG': 0.0369, 'SD': -0.2738, 'CE': -0.0131},
+    'MSE': {'CG': 0.0369, 'SE': -0.2738, 'CE': -0.0131},
+    'PRO': {'N': -0.2548, 'CD': -0.0174, 'CA': 0.0605, 'C': 0.5973, 'O': -0.5679},
 }
 
 
@@ -313,8 +315,12 @@ class ASUGrid:
     def full_3d_to_asu_mean(self, arr_3d):
         return np.bincount(self.full_to_asu, arr_3d.ravel(), minlength=self.n_asu) / self.orbit_mult
 
-    def sym_expand(self, xyz, margin=None, cutoff_A=R_CUT):
-        """Expand Cartesian coordinates by all space-group and lattice images within `cutoff_A` of [0, 1)^3."""
+    def sym_expand(self, xyz, margin=None, cutoff_A=R_CUT, dedup_self: bool = False):
+        """Expand Cartesian coordinates by all space-group and lattice images within `cutoff_A` of [0, 1)^3.
+
+        When `dedup_self=True`, solute atoms sitting on or within 0.25 A of crystallographic special positions
+        emit only one image per coincident self-orbit so PMF/OZ/Epol spline potentials are never multiplied 2x-6x.
+        """
         if len(xyz) == 0:
             return np.zeros((0, 3)), np.zeros(0, dtype=np.int32)
         m_vec = self.f_row_norms * (float(cutoff_A) + 0.05)
@@ -335,14 +341,27 @@ class ASUGrid:
         out_p, out_i = [], []
         lo = -m_vec[None, :]
         hi = 1.0 + m_vec[None, :]
+        prev_gs = []
         for op in self.ops:
             R = np.array(op.rot, dtype=np.float64) / op.DEN
             t = np.array(op.tran, dtype=np.float64) / op.DEN
             g = f @ R.T + t
             g -= np.floor(g)
+            active_atom = None
+            if dedup_self and len(self.ops) > 1:
+                if prev_gs:
+                    dup = np.zeros(len(f), dtype=bool)
+                    for gp in prev_gs:
+                        df = np.mod(g - gp + 0.5, 1.0) - 0.5
+                        d2 = np.sum((df @ self.O.T) ** 2, axis=1)
+                        dup |= (d2 < 0.0625)  # (0.25 A)^2
+                    active_atom = ~dup
+                prev_gs.append(g)
             for s in shifts:
                 h = g + s
                 m = np.all((h >= lo) & (h < hi), axis=1)
+                if active_atom is not None:
+                    m = m & active_atom
                 if np.any(m):
                     out_p.append(h[m] @ self.O.T)
                     out_i.append(np.nonzero(m)[0])
@@ -351,12 +370,48 @@ class ASUGrid:
         return np.vstack(out_p), np.concatenate(out_i).astype(np.int32)
 
 
+def _rec_chain_icode(rec):
+    if len(rec) == 7:
+        return str(rec[5]).strip(), str(rec[6]).strip()
+    if len(rec) >= 8:
+        return str(rec[6]).strip(), str(rec[7]).strip()
+    return '', ''
+
+
+def _gemmi_chain_icode(ch_idx: int, ch: gemmi.Chain, r: gemmi.Residue):
+    ch_tag = ch.name.strip() or f'#{ch_idx}'
+    ic_tag = r.seqid.icode.strip() if r.seqid.icode != '\0' else ''
+    return ch_tag, ic_tag
+
+
 def assign_atom_partial_charges(atom_list, bonded_h_by_idx, bonded_hv_by_idx):
-    """Assign physical AMBER-scale partial atomic charges `q_a` (in elementary charge `e`) to ordered real atoms."""
+    """Assign electrostatically balanced AMBER-scale partial atomic charges `q_a` (in `e`) to ordered real atoms."""
     n = len(atom_list)
     q = np.zeros(n, dtype=np.float64)
-    for i, (_seq, res, name, elem, _xyz) in enumerate(atom_list):
-        rn = res.strip().upper()
+
+    # Identify doubly protonated HIS/HIP rings and C-terminal COO- (C bonded to both O and OXT)
+    res_his_nd1_h = {}
+    res_his_ne2_h = {}
+    cterm_c_indices = set()
+    for i, rec in enumerate(atom_list):
+        rseq, res, name, elem, _ = rec[:5]
+        ch_id, ic_id = _rec_chain_icode(rec)
+        rkey = (ch_id, rseq, ic_id, res.strip().upper())
+        an = name.strip().upper()
+        el = elem.strip().upper()
+        if rkey[3] in ('HIS', 'HID', 'HIE', 'HIP') and el == 'N':
+            if an == 'ND1':
+                res_his_nd1_h[rkey] = len(bonded_h_by_idx[i]) > 0
+            elif an == 'NE2':
+                res_his_ne2_h[rkey] = len(bonded_h_by_idx[i]) > 0
+        if an == 'OXT' and bonded_hv_by_idx[i]:
+            cterm_c_indices.add(bonded_hv_by_idx[i][0])
+
+    for i, rec in enumerate(atom_list):
+        rseq, res, name, elem, _xyz = rec[:5]
+        ch_id, ic_id = _rec_chain_icode(rec)
+        rkey = (ch_id, rseq, ic_id, res.strip().upper())
+        rn = rkey[3]
         an = name.strip().upper()
         el = elem.strip().upper()
         if el == 'D':
@@ -365,49 +420,86 @@ def assign_atom_partial_charges(atom_list, bonded_h_by_idx, bonded_hv_by_idx):
         if rn in ('CL', 'BR', 'I', 'F'):
             q[i] = -1.0
             continue
-        if rn in ('NA', 'K', 'LI'):
+        if rn in ('NA', 'K', 'LI', 'RB', 'CS'):
             q[i] = +1.0
             continue
-        if rn in ('MG', 'ZN', 'CA', 'MN', 'FE', 'CU', 'CO', 'NI'):
+        if rn in ('MG', 'ZN', 'CA', 'MN', 'FE', 'CU', 'CO', 'NI', 'SR', 'BA', 'CD'):
             q[i] = +2.0
             continue
         if rn in ('SO4', 'SUL'):
-            q[i] = 1.38 if el == 'S' else -0.845
+            q[i] = 1.40 if el == 'S' else -0.850
             continue
         if rn in ('PO4', 'PI'):
-            q[i] = 1.35 if el == 'P' else -0.838
+            q[i] = 1.36 if el == 'P' else -0.840
+            continue
+
+        # C-terminal carboxylate (C + O + OXT sums to -0.9706 vs neutral C + O = +0.0294 -> exact -1.0000 shift)
+        if i in cterm_c_indices and an == 'C':
+            q[i] = 0.5994
+            continue
+        if an == 'O' and any(j in cterm_c_indices for j in bonded_hv_by_idx[i]):
+            q[i] = -0.7850
+            continue
+        if an == 'OXT':
+            q[i] = -0.7850
             continue
 
         if rn in ('HIS', 'HID', 'HIE', 'HIP'):
-            if an in _BACKBONE_Q:
+            is_hip = (rn == 'HIP') or (res_his_nd1_h.get(rkey, False) and res_his_ne2_h.get(rkey, False))
+            if an == 'N' and len(bonded_h_by_idx[i]) >= 2:
+                q[i] = -0.3000
+            elif an in _BACKBONE_Q:
                 q[i] = _BACKBONE_Q[an]
+            elif an == 'CG':
+                q[i] = 0.1600 if is_hip else 0.0442
+            elif an == 'CD2':
+                q[i] = 0.1400 if is_hip else 0.0792
+            elif an == 'CE1':
+                q[i] = 0.2400 if is_hip else 0.1557
             elif an in ('ND1', 'NE2'):
-                q[i] = -0.3811 if len(bonded_h_by_idx[i]) > 0 else -0.5432
+                if is_hip:
+                    q[i] = -0.3400
+                else:
+                    q[i] = -0.3811 if len(bonded_h_by_idx[i]) > 0 else -0.3629
             elif an in ('HD1', 'HE2'):
-                q[i] = 0.3649
-            elif an in ('CE1', 'CD2'):
-                q[i] = 0.2057 if an == 'CE1' else 0.1292
+                q[i] = 0.5200 if is_hip else 0.3649
+            elif el == 'C':
+                q[i] = -0.05 * len(bonded_h_by_idx[i])
+            elif el == 'H':
+                q[i] = 0.05
             continue
 
         if an == 'N' and len(bonded_h_by_idx[i]) >= 2:
-            q[i] = -0.3000
+            q[i] = -0.2548 if rn == 'PRO' else -0.3000
             continue
-        if rn == 'CYS' and an == 'SG' and len(bonded_h_by_idx[i]) == 0:
-            q[i] = -0.1081
+        if rn == 'PRO' and an in ('H2', 'H3') and bonded_hv_by_idx[i]:
+            p_idx = bonded_hv_by_idx[i][0]
+            if atom_list[p_idx][2].strip().upper() == 'N' and len(bonded_h_by_idx[p_idx]) >= 2:
+                q[i] = 0.5000
+                continue
+        if rn == 'CYS' and an in ('CB', 'SG') and (
+            (an == 'SG' and len(bonded_h_by_idx[i]) == 0)
+            or (an == 'CB' and any(
+                atom_list[j][2].strip().upper() == 'SG' and len(bonded_h_by_idx[j]) == 0
+                for j in bonded_hv_by_idx[i]
+            ))
+        ):
+            q[i] = _SIDECHAIN_Q['CYX'][an]
             continue
 
         if rn in _SIDECHAIN_Q and an in _SIDECHAIN_Q[rn]:
             q[i] = _SIDECHAIN_Q[rn][an]
         elif an in _BACKBONE_Q:
             q[i] = _BACKBONE_Q[an]
-        elif an == 'OXT':
-            q[i] = -0.7850
         elif el == 'O':
             q[i] = -0.55 if len(bonded_h_by_idx[i]) == 0 else -0.62
         elif el == 'N':
             q[i] = -0.45 if len(bonded_h_by_idx[i]) > 0 else -0.52
         elif el == 'P':
             q[i] = 1.16
+        elif el == 'C':
+            # Balance attached nonpolar C-H (+0.05 each) so CH / CH2 / CH3 groups are strictly neutral
+            q[i] = -0.05 * len(bonded_h_by_idx[i])
         elif el == 'H' and bonded_hv_by_idx[i]:
             pel = atom_list[bonded_hv_by_idx[i][0]][3].strip().upper()
             q[i] = 0.33 if pel in ('N', 'O') else 0.05
@@ -540,14 +632,14 @@ def _build_bonds_and_lone_pairs(ordered_atoms, xyz_real, typ_real, need_lp: bool
 
 
 def classify_conformer_atoms(atoms_list, two_type_heavy_only=False, use_lp=False, return_charges=False, return_lp_parents=False):
-    """Classify [(res_seq, res_name, atom_name, elem, xyz), ...] into ATOM_TYPES (+ optional LP_TYPES 10..12)."""
+    """Classify [(res_seq, res_name, atom_name, elem, xyz[, ...]), ...] into ATOM_TYPES (+ optional LP_TYPES 10..12)."""
     if two_type_heavy_only:
         xyz, typ = [], []
-        for _, _, _, el, pos in atoms_list:
-            el_u = el.upper()
+        for rec in atoms_list:
+            el_u = rec[3].strip().upper()
             if el_u in ('H', 'D'):
                 continue
-            xyz.append(pos)
+            xyz.append(rec[4])
             is_pol = (el_u in ('N', 'O') or el_u in _COMPACT_IONS or el_u in _LARGE_POLAR_IONS)
             typ.append(0 if is_pol else 1)
         xyz_a = np.array(xyz, dtype=np.float64).reshape(-1, 3)
@@ -564,6 +656,7 @@ def classify_conformer_atoms(atoms_list, two_type_heavy_only=False, use_lp=False
 
     heavy_idx = [i for i, a in enumerate(atoms_list) if a[3].strip().upper() not in ('H', 'D')]
     hyd_idx = [i for i, a in enumerate(atoms_list) if a[3].strip().upper() in ('H', 'D')]
+    heavy_elems = [atoms_list[i][3].strip().upper() for i in heavy_idx]
     h_xyz = np.array([atoms_list[i][4] for i in heavy_idx], dtype=np.float64).reshape(-1, 3)
     tree_h = cKDTree(h_xyz) if len(h_xyz) else None
 
@@ -580,16 +673,18 @@ def classify_conformer_atoms(atoms_list, two_type_heavy_only=False, use_lp=False
     his_nd1 = []
     his_ne2 = []
     for hi_local, idx_a in enumerate(heavy_idx):
-        rseq, rname, aname, _, pos = atoms_list[idx_a]
+        rec = atoms_list[idx_a]
+        rseq, rname, aname, _, pos = rec[:5]
+        ch_id, ic_id = _rec_chain_icode(rec)
         if rname in ('HIS', 'HID', 'HIE', 'HIP') and nh_on_heavy[hi_local] >= 1:
             if aname == 'ND1':
-                his_nd1.append((hi_local, rseq, pos))
+                his_nd1.append((hi_local, (ch_id, rseq, ic_id), pos))
             elif aname == 'NE2':
-                his_ne2.append((hi_local, rseq, pos))
+                his_ne2.append((hi_local, (ch_id, rseq, ic_id), pos))
     hip_heavy_locals = set()
-    for hi1, rseq1, p1 in his_nd1:
-        for hi2, rseq2, p2 in his_ne2:
-            if rseq1 == rseq2:
+    for hi1, rkey1, p1 in his_nd1:
+        for hi2, rkey2, p2 in his_ne2:
+            if rkey1 == rkey2:
                 dx = p1[0] - p2[0]
                 dy = p1[1] - p2[1]
                 dz = p1[2] - p2[2]
@@ -602,7 +697,7 @@ def classify_conformer_atoms(atoms_list, two_type_heavy_only=False, use_lp=False
     xyz_out, typ_out = [], []
 
     for hi_local, idx_a in enumerate(heavy_idx):
-        _, rname, aname, el_raw, pos = atoms_list[idx_a]
+        _, rname, aname, el_raw, pos = atoms_list[idx_a][:5]
         el = el_raw.strip().upper()
         nh = nh_on_heavy[hi_local]
         if el == 'N':
@@ -625,7 +720,10 @@ def classify_conformer_atoms(atoms_list, two_type_heavy_only=False, use_lp=False
                   or (rname == 'TYR' and aname == 'OH')):
                 t = 2
             else:
-                t = 0
+                # Ether / glycosidic / ribose O4' / phosphodiester O3',O5' (2 covalent non-metal heavy bonds) -> sp3 O_hyd (2)
+                nbrs = tree_h.query_ball_point(h_xyz[hi_local], 1.82) if tree_h is not None else ()
+                n_cov = sum(1 for j in nbrs if j != hi_local and heavy_elems[j] in ('C', 'P', 'S', 'SI', 'B', 'AS', 'SE'))
+                t = 2 if n_cov >= 2 else 0
         elif el == 'N':
             if has_any_h:
                 t = 2 if (nh == 0 and rname in ('HIS', 'HID', 'HIE', 'HIP') and aname in ('ND1', 'NE2')) else 3
@@ -645,10 +743,10 @@ def classify_conformer_atoms(atoms_list, two_type_heavy_only=False, use_lp=False
         typ_out.append(t)
 
     for idx_a in hyd_idx:
-        _, _, _, _, pos = atoms_list[idx_a]
+        pos = atoms_list[idx_a][4]
         p_loc = parent_of_hyd.get(idx_a, None)
         if p_loc is not None:
-            p_el = atoms_list[heavy_idx[p_loc]][3].strip().upper()
+            p_el = heavy_elems[p_loc]
             if p_el in ('N', 'O'):
                 t = 5 if heavy_is_cationic[p_loc] else 4
             else:
@@ -731,14 +829,15 @@ def load_ensemble(path_or_dir, nconf=32, two_type_heavy_only=False, mode='auto',
         for f in files:
             st = gemmi.read_structure(f)
             al = []
-            for ch in st[0]:
+            for ch_idx, ch in enumerate(st[0]):
                 for r in ch:
                     if r.name in ('HOH', 'WAT', 'DOD'):
                         continue
+                    ch_tag, ic_tag = _gemmi_chain_icode(ch_idx, ch, r)
                     for a in r:
                         if a.occ <= 0:
                             continue
-                        al.append((r.seqid.num, r.name, a.name, a.element.name, a.pos.tolist()))
+                        al.append((r.seqid.num, r.name, a.name, a.element.name, a.pos.tolist(), ch_tag, ic_tag))
             raw_lists.append(al)
         wts = np.full(len(raw_lists), 1.0 / max(len(raw_lists), 1), dtype=np.float64)
         return _finish(raw_lists, wts)
@@ -747,6 +846,8 @@ def load_ensemble(path_or_dir, nconf=32, two_type_heavy_only=False, mode='auto',
     all_alts = set()
     any_h_split_on_blank_hv = False
     n_pos_hv = 0
+    split_res_sets = []
+    split_q_first = []
     for ch in st[0]:
         for r in ch:
             if r.name in ('HOH', 'WAT', 'DOD'):
@@ -754,6 +855,7 @@ def load_ensemble(path_or_dir, nconf=32, two_type_heavy_only=False, mode='auto',
             r_blank_hv = False
             r_alt_hv = False
             r_alt_h_letters = set()
+            r_hv_by_alt = {}
             for a in r:
                 is_h = a.element.name in ('H', 'D')
                 alt_s = a.altloc.strip() if a.altloc != '\0' else ''
@@ -762,12 +864,19 @@ def load_ensemble(path_or_dir, nconf=32, two_type_heavy_only=False, mode='auto',
                     if alt_s:
                         all_alts.add(alt_s)
                         r_alt_hv = True
+                        r_hv_by_alt.setdefault(alt_s, []).append(float(a.occ))
                     else:
                         r_blank_hv = True
                 elif is_h and a.occ > 0 and alt_s:
                     r_alt_h_letters.add(alt_s)
                 elif not is_h and alt_s:
                     r_alt_hv = True
+            if r_hv_by_alt:
+                split_res_sets.append(set(r_hv_by_alt.keys()))
+                l0 = sorted(r_hv_by_alt.keys())[0]
+                tot_q = sum(float(np.mean(v)) for v in r_hv_by_alt.values())
+                if tot_q > 1e-6:
+                    split_q_first.append((l0, float(np.mean(r_hv_by_alt[l0])) / tot_q))
             if r_blank_hv and not r_alt_hv and r_alt_h_letters:
                 any_h_split_on_blank_hv = True
                 all_alts.update(r_alt_h_letters)
@@ -777,30 +886,39 @@ def load_ensemble(path_or_dir, nconf=32, two_type_heavy_only=False, mode='auto',
 
     if not all_alts and not any_h_split_on_blank_hv:
         al = []
-        for ch in st[0]:
+        for ch_idx, ch in enumerate(st[0]):
             for r in ch:
                 if r.name in ('HOH', 'WAT', 'DOD'):
                     continue
+                ch_tag, ic_tag = _gemmi_chain_icode(ch_idx, ch, r)
                 for a in r:
                     if a.occ > 0:
-                        al.append((r.seqid.num, r.name, a.name, a.element.name, a.pos.tolist()))
+                        al.append((r.seqid.num, r.name, a.name, a.element.name, a.pos.tolist(), ch_tag, ic_tag))
         return _finish([al], np.array([1.0], dtype=np.float64))
 
-    use_letters = (mode == 'letters') or (mode == 'auto' and all_alts.issubset({'A', 'B'}))
+    first_alt = sorted(all_alts)[0] if all_alts else ''
+    q_first_vals = [qf for (l0, qf) in split_q_first if l0 == first_alt]
+    letters_auto_safe = (
+        all_alts.issubset({'A', 'B'})
+        and all(s == all_alts for s in split_res_sets)
+        and (len(q_first_vals) <= 1 or (max(q_first_vals) - min(q_first_vals)) <= 0.08)
+    )
+    use_letters = (mode == 'letters') or (mode == 'auto' and letters_auto_safe)
     if use_letters:
         letters = sorted(all_alts)
         mem_lists = {L: [] for L in letters}
         occ_lists = {L: [] for L in letters}
-        for ch in st[0]:
+        for ch_idx, ch in enumerate(st[0]):
             for r in ch:
                 if r.name in ('HOH', 'WAT', 'DOD'):
                     continue
+                ch_tag, ic_tag = _gemmi_chain_icode(ch_idx, ch, r)
                 blank_atoms = []
                 blank_hv = False
                 any_alt_hv = False
                 by_alt_raw = {}
                 for a in r:
-                    rec = (r.seqid.num, r.name, a.name, a.element.name, a.pos.tolist())
+                    rec = (r.seqid.num, r.name, a.name, a.element.name, a.pos.tolist(), ch_tag, ic_tag)
                     alt_s = a.altloc.strip() if a.altloc != '\0' else ''
                     is_h = a.element.name in ('H', 'D')
                     if not alt_s:
@@ -837,7 +955,8 @@ def load_ensemble(path_or_dir, nconf=32, two_type_heavy_only=False, mode='auto',
             path_or_dir, nconf=nconf, occ_flex=occ_flex, quotas='hamilton', rebuild_h=True, add_missing_h=True
         )
         raw_lists = [
-            [(a['seqnum'], a['resname'], a['name'], a['elem'], list(a['pos'])) for a in c]
+            [(a['seqnum'], a['resname'], a['name'], a['elem'], list(a['pos']),
+              str(a.get('chain', '')).strip(), str(a.get('icode', '')).strip()) for a in c]
             for c in confs
         ]
         wts = np.full(len(raw_lists), 1.0 / len(raw_lists), dtype=np.float64)
@@ -845,36 +964,37 @@ def load_ensemble(path_or_dir, nconf=32, two_type_heavy_only=False, mode='auto',
 
     quantiles = (np.arange(nconf, dtype=np.float64) + 0.5) / nconf
     members_raw = [[] for _ in range(nconf)]
-    for ch in st[0]:
+    for ch_idx, ch in enumerate(st[0]):
         for r in ch:
             if r.name in ('HOH', 'WAT', 'DOD'):
                 continue
+            ch_tag, ic_tag = _gemmi_chain_icode(ch_idx, ch, r)
             blank_atoms = []
             blank_hv = False
             any_alt_hv = False
             by_alt_raw = {}
             for a in r:
-                rec = (r.seqid.num, r.name, a.name, a.element.name, a.pos.tolist(), a.occ)
+                rec7 = (r.seqid.num, r.name, a.name, a.element.name, a.pos.tolist(), ch_tag, ic_tag)
                 if a.altloc == '\0' or not a.altloc.strip():
                     if a.occ > 0:
-                        blank_atoms.append(rec[:5])
+                        blank_atoms.append(rec7)
                         if a.element.name not in ('H', 'D'):
                             blank_hv = True
                 else:
                     if a.element.name not in ('H', 'D'):
                         any_alt_hv = True
-                    by_alt_raw.setdefault(a.altloc.strip(), []).append(rec)
+                    by_alt_raw.setdefault(a.altloc.strip(), []).append((rec7, a.occ))
             by_alt = {}
             hv_weights = {}
             for L, recs in by_alt_raw.items():
-                hv_occs = [x[5] for x in recs if x[3] not in ('H', 'D') and x[5] > 0]
+                hv_occs = [occ for (r7, occ) in recs if r7[3] not in ('H', 'D') and occ > 0]
                 if hv_occs:
-                    by_alt[L] = [x[:5] for x in recs if x[5] > 0 or x[3] in ('H', 'D')]
+                    by_alt[L] = [r7 for (r7, occ) in recs if occ > 0 or r7[3] in ('H', 'D')]
                     hv_weights[L] = float(np.mean(hv_occs))
                 elif blank_hv and not any_alt_hv:
-                    h_occs = [x[5] for x in recs if x[5] > 0]
+                    h_occs = [occ for (_, occ) in recs if occ > 0]
                     if h_occs:
-                        by_alt[L] = [x[:5] for x in recs if x[5] > 0]
+                        by_alt[L] = [r7 for (r7, occ) in recs if occ > 0]
                         hv_weights[L] = float(np.mean(h_occs))
             if not by_alt:
                 for m in range(nconf):
@@ -920,7 +1040,7 @@ def _compute_epol_additive_terms(grid: ASUGrid, tree_grid: cKDTree, xyz_real, ty
     if len(xyz_real) == 0:
         return ex, ey, ez, e_self, lgate
 
-    SE, Sei = grid.sym_expand(xyz_real, cutoff_A=E_CUT)
+    SE, Sei = grid.sym_expand(xyz_real, cutoff_A=E_CUT, dedup_self=True)
     if len(SE) == 0:
         return ex, ey, ez, e_self, lgate
     St_e = typ_real[Sei]
@@ -973,11 +1093,13 @@ def _epol_features_from_additive(ex, ey, ez, e_self, lgate):
     return np.column_stack([f_mag, f_sq, f_coop])
 
 
-def build_asu_features(grid: ASUGrid, members, n_types=10, include_hpol=True,
+def build_asu_features(grid: ASUGrid, members, n_types=None, include_hpol=True,
                        include_tet_oz=False, include_epol=False, charges=None,
                        member_weights=None, return_extra=False, max_workers=8):
     """Precompute per-member cubic B-spline tensors (and optional TetOZ / Epol features) on the ASU grid."""
     M = len(members)
+    if n_types is None:
+        n_types = 13 if any(len(t) > 0 and np.any(t >= 10) for _, t in members) else 10
     n_asu = grid.n_asu
     n_feat = int(n_types) * N_KNOTS
     two_type = (int(n_types) == 2)
@@ -1001,7 +1123,7 @@ def build_asu_features(grid: ASUGrid, members, n_types=10, include_hpol=True,
         else:
             xyz_use, typ_use = xyz, typ
 
-        SX, Si = grid.sym_expand(xyz_use, cutoff_A=R_CUT)
+        SX, Si = grid.sym_expand(xyz_use, cutoff_A=R_CUT, dedup_self=True)
         if len(SX) > 0:
             St = typ_use[Si]
             nb = tree_grid.query_ball_point(SX, R_CUT)
@@ -1052,7 +1174,7 @@ def build_asu_features(grid: ASUGrid, members, n_types=10, include_hpol=True,
         if include_tet_oz and len(xyz_r) > 0:
             pol_hv = (typ_r == 0) if two_type else ((typ_r == 0) | (typ_r == 1) | (typ_r == 2) | (typ_r == 3))
             if np.any(pol_hv):
-                SP, _ = grid.sym_expand(xyz_r[pol_hv], cutoff_A=1.8)
+                SP, _ = grid.sym_expand(xyz_r[pol_hv], cutoff_A=1.8, dedup_self=True)
                 if len(SP) > 0:
                     nb_p = tree_grid.query_ball_point(SP, 1.5)
                     lp = np.array([len(x) for x in nb_p], dtype=np.int32)
@@ -1191,9 +1313,10 @@ class WaterFieldSpec:
     """Configuration & parameter packing for the differentiable hydration field."""
 
     def __init__(self, n_types=None, use_langmuir=True, use_oz=True, use_hpol=True, use_blur=True,
-                 fit_box_scale=False, n_datasets=1, use_lp=None, use_tet_oz=False, n_oz_steps=None,
-                 use_epol=False, use_pauli_cap=False, zero_bulk_offset=False):
-        if n_types is None:
+                 fit_box_scale=False, n_datasets=1, use_lp=None, use_tet_oz=None, n_oz_steps=None,
+                 use_epol=False, use_pauli_cap=None, zero_bulk_offset=None):
+        is_default_v2 = (n_types is None)
+        if is_default_v2:
             self.use_lp = True if use_lp is None else bool(use_lp)
             self.n_types = 13 if self.use_lp else 10
         else:
@@ -1210,14 +1333,15 @@ class WaterFieldSpec:
 
         self.use_langmuir = bool(use_langmuir)
         self.use_oz = bool(use_oz)
-        self.use_tet_oz = bool(use_tet_oz) and self.use_oz
+        tet_default = is_default_v2 if use_tet_oz is None else bool(use_tet_oz)
+        self.use_tet_oz = tet_default and self.use_oz
         if n_oz_steps is None:
             self.n_oz_steps = 4 if self.use_tet_oz else 1
         else:
             self.n_oz_steps = max(1, int(n_oz_steps)) if self.use_oz else 0
         self.use_epol = bool(use_epol)
-        self.use_pauli_cap = bool(use_pauli_cap)
-        self.zero_bulk_offset = bool(zero_bulk_offset)
+        self.use_pauli_cap = is_default_v2 if use_pauli_cap is None else bool(use_pauli_cap)
+        self.zero_bulk_offset = is_default_v2 if zero_bulk_offset is None else bool(zero_bulk_offset)
         self.use_hpol = bool(use_hpol)
         self.use_blur = bool(use_blur)
         self.fit_box_scale = bool(fit_box_scale)
@@ -1668,7 +1792,7 @@ def forward_direct(spec: WaterFieldSpec, grid: ASUGrid, members, member_weights,
         else:
             xyz_use, typ_use = xyz_sub, typ_sub
 
-        SX, Si = grid.sym_expand(xyz_use, cutoff_A=R_CUT)
+        SX, Si = grid.sym_expand(xyz_use, cutoff_A=R_CUT, dedup_self=True)
         if len(SX) > 0:
             St = typ_use[Si]
             nb = tree_grid.query_ball_point(SX, R_CUT)
@@ -1717,7 +1841,7 @@ def forward_direct(spec: WaterFieldSpec, grid: ASUGrid, members, member_weights,
         if spec.use_tet_oz and len(xyz_r) > 0:
             pol_hv = (typ_r == 0) if two_type else ((typ_r == 0) | (typ_r == 1) | (typ_r == 2) | (typ_r == 3))
             if np.any(pol_hv):
-                SP, _ = grid.sym_expand(xyz_r[pol_hv], cutoff_A=1.8)
+                SP, _ = grid.sym_expand(xyz_r[pol_hv], cutoff_A=1.8, dedup_self=True)
                 if len(SP) > 0:
                     nb_p = tree_grid.query_ball_point(SP, 1.5)
                     lp = np.array([len(x) for x in nb_p], dtype=np.int32)

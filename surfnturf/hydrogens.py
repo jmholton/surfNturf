@@ -272,13 +272,29 @@ def _best_rotatable_xh(x_pos, parent_pos, stagger_ref_pos, d, angle_deg, acc_tre
     return best_h
 
 
+def _unpack_atom_rec(rec):
+    """Extract `(rseq, rname, aname, elem, pos, biso, chain, icode)` from 5-, 6-, 7-, or 8-tuples."""
+    n = len(rec)
+    rseq, rname, aname, elem, pos = rec[0], rec[1], rec[2], rec[3], rec[4]
+    if n == 5:
+        return rseq, rname, aname, elem, pos, 15.0, "", ""
+    if n == 6:
+        return rseq, rname, aname, elem, pos, float(rec[5]), "", ""
+    if n == 7:
+        return rseq, rname, aname, elem, pos, 15.0, str(rec[5]).strip(), str(rec[6]).strip()
+    return rseq, rname, aname, elem, pos, float(rec[5]), str(rec[6]).strip(), str(rec[7]).strip()
+
+
 def complete_conformer_hydrogens(atoms_list, mode="auto"):
-    """Add missing riding hydrogens to a single-conformer atom list (`5`-tuple or `6`-tuple with `biso`).
+    """Add missing riding hydrogens to a single-conformer atom list (preserving tuple schema).
 
     Parameters
     ----------
     atoms_list : list of tuples
-        Either `(seqnum, resname, atom_name, elem, pos)` or `(seqnum, resname, atom_name, elem, pos, biso)`.
+        Supports `(seqnum, resname, atom_name, elem, pos)` (5-tuple),
+        `(seqnum, resname, atom_name, elem, pos, biso)` (6-tuple),
+        `(seqnum, resname, atom_name, elem, pos, chain, icode)` (7-tuple), or
+        `(seqnum, resname, atom_name, elem, pos, biso, chain, icode)` (8-tuple).
     mode : str
         `'auto'` or `'1'`/`True` completes missing standard riding hydrogens while preserving all existing H/D;
         `'0'`/`False`/`'none'` returns `atoms_list` unchanged.
@@ -286,7 +302,9 @@ def complete_conformer_hydrogens(atoms_list, mode="auto"):
     if mode in (False, "0", "false", "False", "none", "None") or not atoms_list:
         return atoms_list
 
-    has_biso = len(atoms_list[0]) >= 6
+    rec_len = len(atoms_list[0])
+    has_biso = rec_len in (6, 8) or rec_len > 8
+    has_chain = rec_len >= 7
     hv_indices = []
     hy_indices = []
     n_h = 0
@@ -341,17 +359,19 @@ def complete_conformer_hydrogens(atoms_list, mode="auto"):
     metal_xyz = np.array(metal_pts, dtype=np.float64).reshape(-1, 3)
     metal_tree = cKDTree(metal_xyz) if len(metal_xyz) else None
 
-    # Partition atoms_list into ordered residue blocks without multi-chain seqnum collisions
+    # Partition atoms_list into ordered residue blocks keyed by (chain, seqnum, icode, resname)
     res_blocks = []
     cur_key = None
     cur_seen = set()
     cur_block = []
     for idx, rec in enumerate(atoms_list):
-        rseq, rname, aname = rec[0], rec[1].strip().upper(), rec[2].strip().upper()
-        key = (rseq, rname)
+        rseq, rname_raw, aname_raw, _, _, _, chain_id, icode = _unpack_atom_rec(rec)
+        rname = rname_raw.strip().upper()
+        aname = aname_raw.strip().upper()
+        key = (chain_id, rseq, icode, rname)
         if key != cur_key or aname in cur_seen:
             if cur_block:
-                res_blocks.append((cur_key[0], cur_key[1], cur_block))
+                res_blocks.append((cur_key[0], cur_key[1], cur_key[2], cur_key[3], cur_block))
             cur_key = key
             cur_seen = {aname}
             cur_block = [idx]
@@ -359,32 +379,37 @@ def complete_conformer_hydrogens(atoms_list, mode="auto"):
             cur_seen.add(aname)
             cur_block.append(idx)
     if cur_block:
-        res_blocks.append((cur_key[0], cur_key[1], cur_block))
+        res_blocks.append((cur_key[0], cur_key[1], cur_key[2], cur_key[3], cur_block))
 
     # Build per-residue heavy-atom lookup: aname -> (pos_np, hv_local_idx, biso)
     res_maps = []
-    for rseq, rname, idxs in res_blocks:
+    for chain_id, rseq, icode, rname, idxs in res_blocks:
         amap = {}
         for gi in idxs:
-            rec = atoms_list[gi]
-            el = rec[3].strip().upper()
-            if el in ("H", "D"):
+            _, _, an_raw, el_raw, _, biso, _, _ = _unpack_atom_rec(atoms_list[gi])
+            if el_raw.strip().upper() in ("H", "D"):
                 continue
-            an = rec[2].strip().upper()
-            biso = float(rec[5]) if has_biso else 15.0
-            amap[an] = (hv_xyz[hv_global_to_local[gi]], hv_global_to_local[gi], biso)
-        res_maps.append((rseq, rname, idxs, amap))
+            amap[an_raw.strip().upper()] = (hv_xyz[hv_global_to_local[gi]], hv_global_to_local[gi], biso)
+        res_maps.append((chain_id, rseq, icode, rname, idxs, amap))
 
-    def _make_rec(rseq, rname, hname, pos_arr, parent_biso):
+    def _make_rec(rseq, rname, hname, pos_arr, parent_biso, chain_id, icode):
         p_list = [float(pos_arr[0]), float(pos_arr[1]), float(pos_arr[2])]
+        h_biso = min(999.0, 1.2 * float(parent_biso))
+        if has_biso and has_chain:
+            return (rseq, rname, hname, h_sym, p_list, h_biso, chain_id, icode)
+        if has_chain:
+            return (rseq, rname, hname, h_sym, p_list, chain_id, icode)
         if has_biso:
-            return (rseq, rname, hname, h_sym, p_list, min(999.0, 1.2 * float(parent_biso)))
+            return (rseq, rname, hname, h_sym, p_list, h_biso)
         return (rseq, rname, hname, h_sym, p_list)
 
     out_atoms = []
-    for b_idx, (rseq, rname, idxs, amap) in enumerate(res_maps):
+    for b_idx, (chain_id, rseq, icode, rname, idxs, amap) in enumerate(res_maps):
         for gi in idxs:
             out_atoms.append(atoms_list[gi])
+
+        def _mrec(hname, pos_arr, parent_biso):
+            return _make_rec(rseq, rname, hname, pos_arr, parent_biso, chain_id, icode)
 
         def _has_h(aname):
             return (aname not in amap) or (nh_on_hv[amap[aname][1]] > 0)
@@ -397,9 +422,10 @@ def complete_conformer_hydrogens(atoms_list, mode="auto"):
             if "N" in amap and "CA" in amap and not _has_h("N") and not _near_metal(amap["N"][0], 2.35):
                 n_pos, n_li, n_b = amap["N"]
                 ca_pos = amap["CA"][0]
+                same_chain = (b_idx > 0 and chain_id == res_maps[b_idx - 1][0])
                 c_prev_pos = None
-                if b_idx > 0 and "C" in res_maps[b_idx - 1][3]:
-                    cand_c = res_maps[b_idx - 1][3]["C"][0]
+                if same_chain and "C" in res_maps[b_idx - 1][5]:
+                    cand_c = res_maps[b_idx - 1][5]["C"][0]
                     if _bonded(cand_c, n_pos, 1.68):
                         c_prev_pos = cand_c
                 if c_prev_pos is None:
@@ -411,16 +437,16 @@ def complete_conformer_hydrogens(atoms_list, mode="auto"):
                     ]
                     if extra_cov:
                         c_prev_pos = hv_xyz[extra_cov[0]]
-                # Without C(i-1), only a true chain start is NH3+: the first block, a non-amino-acid
-                # predecessor, or restarted numbering (new chain). A gap inside a chain stays an amide N with
-                # no H, since its in-plane H direction is undefined without C(i-1).
+                # Without C(i-1), a true chain start is NH3+: the first block, a new chain ID, a non-amino-acid
+                # predecessor, or restarted (seqnum, icode) numbering. An internal gap within the same chain stays
+                # an amide N with no H, since its in-plane H direction is undefined without C(i-1).
                 n_terminus = False
                 if c_prev_pos is None:
-                    if b_idx == 0 or res_maps[b_idx - 1][1] not in _STD_AA:
+                    if b_idx == 0 or (not same_chain) or res_maps[b_idx - 1][3] not in _STD_AA:
                         n_terminus = True
                     else:
                         try:
-                            n_terminus = int(rseq) <= int(res_maps[b_idx - 1][0])
+                            n_terminus = (int(rseq), icode) <= (int(res_maps[b_idx - 1][1]), res_maps[b_idx - 1][2])
                         except (TypeError, ValueError):
                             n_terminus = False
 
@@ -428,19 +454,19 @@ def complete_conformer_hydrogens(atoms_list, mode="auto"):
                     if c_prev_pos is None and n_terminus and "CD" in amap:
                         pair = _sp3_methylene(n_pos, ca_pos, amap["CD"][0], d=D_NH_SP3)
                         if pair is not None:
-                            out_atoms.append(_make_rec(rseq, rname, "H2", pair[0], n_b))
-                            out_atoms.append(_make_rec(rseq, rname, "H3", pair[1], n_b))
+                            out_atoms.append(_mrec("H2", pair[0], n_b))
+                            out_atoms.append(_mrec("H3", pair[1], n_b))
                 else:
                     if c_prev_pos is not None:
                         h_am = _sp2_bisector(n_pos, c_prev_pos, ca_pos, d=D_NH_SP2)
                         if h_am is not None:
-                            out_atoms.append(_make_rec(rseq, rname, h_sym, h_am, n_b))
+                            out_atoms.append(_mrec(h_sym, h_am, n_b))
                     elif n_terminus:
                         ref_p = amap["C"][0] if "C" in amap else (amap["CB"][0] if "CB" in amap else None)
                         tri = _sp3_rotor3(n_pos, ca_pos, ref_p, d=D_NH_SP3)
                         if tri is not None:
                             for k_h, hp in enumerate(tri, 1):
-                                out_atoms.append(_make_rec(rseq, rname, f"H{k_h}", hp, n_b))
+                                out_atoms.append(_mrec(f"H{k_h}", hp, n_b))
 
             # 2. Backbone CA (HA or GLY HA2/HA3)
             if "CA" in amap and "N" in amap and "C" in amap and not _has_h("CA"):
@@ -448,12 +474,12 @@ def complete_conformer_hydrogens(atoms_list, mode="auto"):
                 if rname == "GLY":
                     pair = _sp3_methylene(ca_pos, amap["N"][0], amap["C"][0], d=D_CH_2)
                     if pair is not None:
-                        out_atoms.append(_make_rec(rseq, rname, "HA2", pair[0], ca_b))
-                        out_atoms.append(_make_rec(rseq, rname, "HA3", pair[1], ca_b))
+                        out_atoms.append(_mrec("HA2", pair[0], ca_b))
+                        out_atoms.append(_mrec("HA3", pair[1], ca_b))
                 elif "CB" in amap:
                     ha = _sp3_methine(ca_pos, amap["N"][0], amap["C"][0], amap["CB"][0], d=D_CH_1)
                     if ha is not None:
-                        out_atoms.append(_make_rec(rseq, rname, "HA", ha, ca_b))
+                        out_atoms.append(_mrec("HA", ha, ca_b))
 
             # 3. Sidechain methines (VAL/ILE/THR CB, LEU CG)
             if rname in ("VAL", "ILE", "THR") and "CB" in amap and not _has_h("CB"):
@@ -461,19 +487,19 @@ def complete_conformer_hydrogens(atoms_list, mode="auto"):
                 if all(k in amap for k in tri_names):
                     hb = _sp3_methine(amap["CB"][0], amap[tri_names[0]][0], amap[tri_names[1]][0], amap[tri_names[2]][0], d=D_CH_1)
                     if hb is not None:
-                        out_atoms.append(_make_rec(rseq, rname, "HB", hb, amap["CB"][2]))
+                        out_atoms.append(_mrec("HB", hb, amap["CB"][2]))
             if rname == "LEU" and "CG" in amap and not _has_h("CG") and all(k in amap for k in ("CB", "CD1", "CD2")):
                 hg = _sp3_methine(amap["CG"][0], amap["CB"][0], amap["CD1"][0], amap["CD2"][0], d=D_CH_1)
                 if hg is not None:
-                    out_atoms.append(_make_rec(rseq, rname, "HG", hg, amap["CG"][2]))
+                    out_atoms.append(_mrec("HG", hg, amap["CG"][2]))
 
             # 4. Sidechain methylenes (CH2)
             for c_nm, n1_nm, n2_nm, (hn1, hn2) in _SIDECHAIN_CH2.get(rname, ()):
                 if c_nm in amap and n1_nm in amap and n2_nm in amap and not _has_h(c_nm):
                     pair = _sp3_methylene(amap[c_nm][0], amap[n1_nm][0], amap[n2_nm][0], d=D_CH_2)
                     if pair is not None:
-                        out_atoms.append(_make_rec(rseq, rname, hn1, pair[0], amap[c_nm][2]))
-                        out_atoms.append(_make_rec(rseq, rname, hn2, pair[1], amap[c_nm][2]))
+                        out_atoms.append(_mrec(hn1, pair[0], amap[c_nm][2]))
+                        out_atoms.append(_mrec(hn2, pair[1], amap[c_nm][2]))
 
             # 5. Sidechain methyls (CH3)
             for c_nm, p_nm, ref_nm, (hn1, hn2, hn3) in _SIDECHAIN_CH3.get(rname, ()):
@@ -482,51 +508,51 @@ def complete_conformer_hydrogens(atoms_list, mode="auto"):
                     tri = _sp3_rotor3(amap[c_nm][0], amap[p_nm][0], ref_p, d=D_CH_3)
                     if tri is not None:
                         for hn, hp in zip((hn1, hn2, hn3), tri):
-                            out_atoms.append(_make_rec(rseq, rname, hn, hp, amap[c_nm][2]))
+                            out_atoms.append(_mrec(hn, hp, amap[c_nm][2]))
 
             # 6. Aromatic ring C-H
             for c_nm, n1_nm, n2_nm, hn in _SIDECHAIN_AR_CH.get(rname, ()):
                 if c_nm in amap and n1_nm in amap and n2_nm in amap and not _has_h(c_nm):
                     hp = _sp2_bisector(amap[c_nm][0], amap[n1_nm][0], amap[n2_nm][0], d=D_CH_AR)
                     if hp is not None:
-                        out_atoms.append(_make_rec(rseq, rname, hn, hp, amap[c_nm][2]))
+                        out_atoms.append(_mrec(hn, hp, amap[c_nm][2]))
 
             # 7. Sidechain polar & cationic N-H / O-H / S-H
             if rname == "ASN" and "ND2" in amap and "CG" in amap and "OD1" in amap and not _has_h("ND2"):
                 nh2 = _sp2_nh2(amap["ND2"][0], amap["CG"][0], amap["OD1"][0], d=D_NH_SP2)
                 if nh2 is not None:
-                    out_atoms.append(_make_rec(rseq, rname, "HD21", nh2[0], amap["ND2"][2]))
-                    out_atoms.append(_make_rec(rseq, rname, "HD22", nh2[1], amap["ND2"][2]))
+                    out_atoms.append(_mrec("HD21", nh2[0], amap["ND2"][2]))
+                    out_atoms.append(_mrec("HD22", nh2[1], amap["ND2"][2]))
 
             elif rname == "GLN" and "NE2" in amap and "CD" in amap and "OE1" in amap and not _has_h("NE2"):
                 nh2 = _sp2_nh2(amap["NE2"][0], amap["CD"][0], amap["OE1"][0], d=D_NH_SP2)
                 if nh2 is not None:
-                    out_atoms.append(_make_rec(rseq, rname, "HE21", nh2[0], amap["NE2"][2]))
-                    out_atoms.append(_make_rec(rseq, rname, "HE22", nh2[1], amap["NE2"][2]))
+                    out_atoms.append(_mrec("HE21", nh2[0], amap["NE2"][2]))
+                    out_atoms.append(_mrec("HE22", nh2[1], amap["NE2"][2]))
 
             elif rname == "LYS" and "NZ" in amap and "CE" in amap and not _has_h("NZ") and not _near_metal(amap["NZ"][0]):
                 ref_p = amap["CD"][0] if "CD" in amap else None
                 tri = _sp3_rotor3(amap["NZ"][0], amap["CE"][0], ref_p, d=D_NH_SP3)
                 if tri is not None:
                     for hn, hp in zip(("HZ1", "HZ2", "HZ3"), tri):
-                        out_atoms.append(_make_rec(rseq, rname, hn, hp, amap["NZ"][2]))
+                        out_atoms.append(_mrec(hn, hp, amap["NZ"][2]))
 
             elif rname == "ARG":
                 if "NE" in amap and "CD" in amap and "CZ" in amap and not _has_h("NE"):
                     he = _sp2_bisector(amap["NE"][0], amap["CD"][0], amap["CZ"][0], d=D_NH_SP2)
                     if he is not None:
-                        out_atoms.append(_make_rec(rseq, rname, "HE", he, amap["NE"][2]))
+                        out_atoms.append(_mrec("HE", he, amap["NE"][2]))
                 for nh_nm, h1_nm, h2_nm in (("NH1", "HH11", "HH12"), ("NH2", "HH21", "HH22")):
                     if nh_nm in amap and "CZ" in amap and "NE" in amap and not _has_h(nh_nm):
                         nh2 = _sp2_nh2(amap[nh_nm][0], amap["CZ"][0], amap["NE"][0], d=D_NH_SP2)
                         if nh2 is not None:
-                            out_atoms.append(_make_rec(rseq, rname, h1_nm, nh2[0], amap[nh_nm][2]))
-                            out_atoms.append(_make_rec(rseq, rname, h2_nm, nh2[1], amap[nh_nm][2]))
+                            out_atoms.append(_mrec(h1_nm, nh2[0], amap[nh_nm][2]))
+                            out_atoms.append(_mrec(h2_nm, nh2[1], amap[nh_nm][2]))
 
             elif rname == "TRP" and "NE1" in amap and "CD1" in amap and "CE2" in amap and not _has_h("NE1"):
                 he1 = _sp2_bisector(amap["NE1"][0], amap["CD1"][0], amap["CE2"][0], d=D_NH_SP2)
                 if he1 is not None:
-                    out_atoms.append(_make_rec(rseq, rname, "HE1", he1, amap["NE1"][2]))
+                    out_atoms.append(_mrec("HE1", he1, amap["NE1"][2]))
 
             elif rname in ("HIS", "HID", "HIE", "HIP"):
                 has_nd1_h = _has_h("ND1")
@@ -543,15 +569,15 @@ def complete_conformer_hydrogens(atoms_list, mode="auto"):
                 )
                 if rname == "HIP":
                     if hd1_cand is not None:
-                        out_atoms.append(_make_rec(rseq, rname, "HD1", hd1_cand, amap["ND1"][2]))
+                        out_atoms.append(_mrec("HD1", hd1_cand, amap["ND1"][2]))
                     if he2_cand is not None:
-                        out_atoms.append(_make_rec(rseq, rname, "HE2", he2_cand, amap["NE2"][2]))
+                        out_atoms.append(_mrec("HE2", he2_cand, amap["NE2"][2]))
                 elif rname == "HID":
                     if hd1_cand is not None:
-                        out_atoms.append(_make_rec(rseq, rname, "HD1", hd1_cand, amap["ND1"][2]))
+                        out_atoms.append(_mrec("HD1", hd1_cand, amap["ND1"][2]))
                 elif rname == "HIE":
                     if he2_cand is not None:
-                        out_atoms.append(_make_rec(rseq, rname, "HE2", he2_cand, amap["NE2"][2]))
+                        out_atoms.append(_mrec("HE2", he2_cand, amap["NE2"][2]))
                 elif not has_nd1_h and not has_ne2_h:
                     # Generic HIS with 0 ring N-H: choose tautomer from local H-bond acceptors (default HID,
                     # matching field.py's heavy-atom-only typing of HIS so completion does not flip the tautomer)
@@ -570,29 +596,29 @@ def complete_conformer_hydrogens(atoms_list, mode="auto"):
                     s_d1 = _hb_score(hd1_cand, amap["ND1"][0]) if hd1_cand is not None else -1.0
                     s_e2 = _hb_score(he2_cand, amap["NE2"][0]) if he2_cand is not None else -1.0
                     if s_e2 > s_d1 + 0.15 and he2_cand is not None:
-                        out_atoms.append(_make_rec(rseq, rname, "HE2", he2_cand, amap["NE2"][2]))
+                        out_atoms.append(_mrec("HE2", he2_cand, amap["NE2"][2]))
                     elif hd1_cand is not None:
-                        out_atoms.append(_make_rec(rseq, rname, "HD1", hd1_cand, amap["ND1"][2]))
+                        out_atoms.append(_mrec("HD1", hd1_cand, amap["ND1"][2]))
                     elif he2_cand is not None:
-                        out_atoms.append(_make_rec(rseq, rname, "HE2", he2_cand, amap["NE2"][2]))
+                        out_atoms.append(_mrec("HE2", he2_cand, amap["NE2"][2]))
 
             elif rname == "SER" and "OG" in amap and "CB" in amap and not _has_h("OG") and not _near_metal(amap["OG"][0]):
                 ref_p = amap["CA"][0] if "CA" in amap else None
                 hg = _best_rotatable_xh(amap["OG"][0], amap["CB"][0], ref_p, D_OH, 109.5, acc_tree, acc_xyz, hv_tree)
                 if hg is not None:
-                    out_atoms.append(_make_rec(rseq, rname, "HG", hg, amap["OG"][2]))
+                    out_atoms.append(_mrec("HG", hg, amap["OG"][2]))
 
             elif rname == "THR" and "OG1" in amap and "CB" in amap and not _has_h("OG1") and not _near_metal(amap["OG1"][0]):
                 ref_p = amap["CA"][0] if "CA" in amap else None
                 hg1 = _best_rotatable_xh(amap["OG1"][0], amap["CB"][0], ref_p, D_OH, 109.5, acc_tree, acc_xyz, hv_tree)
                 if hg1 is not None:
-                    out_atoms.append(_make_rec(rseq, rname, "HG1", hg1, amap["OG1"][2]))
+                    out_atoms.append(_mrec("HG1", hg1, amap["OG1"][2]))
 
             elif rname == "TYR" and "OH" in amap and "CZ" in amap and not _has_h("OH") and not _near_metal(amap["OH"][0]):
                 ref_p = amap["CE1"][0] if "CE1" in amap else None
                 hh = _best_rotatable_xh(amap["OH"][0], amap["CZ"][0], ref_p, D_OH, 109.5, acc_tree, acc_xyz, hv_tree, planar_bias=True)
                 if hh is not None:
-                    out_atoms.append(_make_rec(rseq, rname, "HH", hh, amap["OH"][2]))
+                    out_atoms.append(_mrec("HH", hh, amap["OH"][2]))
 
             elif rname == "CYS" and "SG" in amap and "CB" in amap and not _has_h("SG"):
                 sg_pos = amap["SG"][0]
@@ -603,38 +629,97 @@ def complete_conformer_hydrogens(atoms_list, mode="auto"):
                     ref_p = amap["CA"][0] if "CA" in amap else None
                     hg = _best_rotatable_xh(sg_pos, amap["CB"][0], ref_p, D_SH, 96.0, acc_tree, acc_xyz, hv_tree)
                     if hg is not None:
-                        out_atoms.append(_make_rec(rseq, rname, "HG", hg, amap["SG"][2]))
+                        out_atoms.append(_mrec("HG", hg, amap["SG"][2]))
 
         elif rname in _STD_NA:
-            # Nucleobase polar NH / NH2 + aromatic C-H + RNA 2'-OH
+            # Nucleobase polar NH / NH2 + aromatic/methyl C-H + ribose/deoxyribose C-H + RNA 2'-OH
             if rname in ("A", "DA", "ADE") and "N6" in amap and "C6" in amap and "N1" in amap and not _has_h("N6"):
                 nh2 = _sp2_nh2(amap["N6"][0], amap["C6"][0], amap["N1"][0], d=D_NH_SP2)
                 if nh2 is not None:
-                    out_atoms.append(_make_rec(rseq, rname, "H61", nh2[0], amap["N6"][2]))
-                    out_atoms.append(_make_rec(rseq, rname, "H62", nh2[1], amap["N6"][2]))
+                    out_atoms.append(_mrec("H61", nh2[0], amap["N6"][2]))
+                    out_atoms.append(_mrec("H62", nh2[1], amap["N6"][2]))
             elif rname in ("C", "DC", "CYT") and "N4" in amap and "C4" in amap and "N3" in amap and not _has_h("N4"):
                 nh2 = _sp2_nh2(amap["N4"][0], amap["C4"][0], amap["N3"][0], d=D_NH_SP2)
                 if nh2 is not None:
-                    out_atoms.append(_make_rec(rseq, rname, "H41", nh2[0], amap["N4"][2]))
-                    out_atoms.append(_make_rec(rseq, rname, "H42", nh2[1], amap["N4"][2]))
+                    out_atoms.append(_mrec("H41", nh2[0], amap["N4"][2]))
+                    out_atoms.append(_mrec("H42", nh2[1], amap["N4"][2]))
             elif rname in ("G", "DG", "GUA"):
                 if "N1" in amap and "C6" in amap and "C2" in amap and not _has_h("N1"):
                     h1 = _sp2_bisector(amap["N1"][0], amap["C6"][0], amap["C2"][0], d=D_NH_SP2)
                     if h1 is not None:
-                        out_atoms.append(_make_rec(rseq, rname, "H1", h1, amap["N1"][2]))
+                        out_atoms.append(_mrec("H1", h1, amap["N1"][2]))
                 if "N2" in amap and "C2" in amap and "N3" in amap and not _has_h("N2"):
                     nh2 = _sp2_nh2(amap["N2"][0], amap["C2"][0], amap["N3"][0], d=D_NH_SP2)
                     if nh2 is not None:
-                        out_atoms.append(_make_rec(rseq, rname, "H21", nh2[0], amap["N2"][2]))
-                        out_atoms.append(_make_rec(rseq, rname, "H22", nh2[1], amap["N2"][2]))
+                        out_atoms.append(_mrec("H21", nh2[0], amap["N2"][2]))
+                        out_atoms.append(_mrec("H22", nh2[1], amap["N2"][2]))
             elif rname in ("U", "DT", "URI", "THY") and "N3" in amap and "C2" in amap and "C4" in amap and not _has_h("N3"):
                 h3 = _sp2_bisector(amap["N3"][0], amap["C2"][0], amap["C4"][0], d=D_NH_SP2)
                 if h3 is not None:
-                    out_atoms.append(_make_rec(rseq, rname, "H3", h3, amap["N3"][2]))
+                    out_atoms.append(_mrec("H3", h3, amap["N3"][2]))
+
+            # Purine / pyrimidine aromatic C-H & thymine methyl
+            if rname in ("A", "DA", "ADE", "G", "DG", "GUA") and "C8" in amap and "N7" in amap and "N9" in amap and not _has_h("C8"):
+                h8 = _sp2_bisector(amap["C8"][0], amap["N7"][0], amap["N9"][0], d=D_CH_AR)
+                if h8 is not None:
+                    out_atoms.append(_mrec("H8", h8, amap["C8"][2]))
+            if rname in ("A", "DA", "ADE") and "C2" in amap and "N1" in amap and "N3" in amap and not _has_h("C2"):
+                h2 = _sp2_bisector(amap["C2"][0], amap["N1"][0], amap["N3"][0], d=D_CH_AR)
+                if h2 is not None:
+                    out_atoms.append(_mrec("H2", h2, amap["C2"][2]))
+            if rname in ("C", "DC", "CYT", "U", "DT", "URI", "THY"):
+                if "C6" in amap and "N1" in amap and "C5" in amap and not _has_h("C6"):
+                    h6 = _sp2_bisector(amap["C6"][0], amap["N1"][0], amap["C5"][0], d=D_CH_AR)
+                    if h6 is not None:
+                        out_atoms.append(_mrec("H6", h6, amap["C6"][2]))
+                if rname in ("C", "DC", "CYT", "U", "URI") and "C5" in amap and "C4" in amap and "C6" in amap and not _has_h("C5"):
+                    h5 = _sp2_bisector(amap["C5"][0], amap["C4"][0], amap["C6"][0], d=D_CH_AR)
+                    if h5 is not None:
+                        out_atoms.append(_mrec("H5", h5, amap["C5"][2]))
+                if rname in ("DT", "THY"):
+                    cm_nm = "C7" if "C7" in amap else ("C5M" if "C5M" in amap else None)
+                    if cm_nm is not None and "C5" in amap and not _has_h(cm_nm):
+                        ref_c4 = amap["C4"][0] if "C4" in amap else None
+                        hm3 = _sp3_rotor3(amap[cm_nm][0], amap["C5"][0], ref_c4, d=D_CH_3)
+                        if hm3 is not None:
+                            h_lbls = ("H71", "H72", "H73") if cm_nm == "C7" else ("H5M1", "H5M2", "H5M3")
+                            for h_nm, h_p in zip(h_lbls, hm3):
+                                out_atoms.append(_mrec(h_nm, h_p, amap[cm_nm][2]))
+
+            # Ribose / deoxyribose sugar C-H
+            gly_n = "N9" if rname in ("A", "DA", "ADE", "G", "DG", "GUA") else "N1"
+            if "C1'" in amap and "O4'" in amap and "C2'" in amap and gly_n in amap and not _has_h("C1'"):
+                h1p = _sp3_methine(amap["C1'"][0], amap["O4'"][0], amap["C2'"][0], amap[gly_n][0], d=D_CH_1)
+                if h1p is not None:
+                    out_atoms.append(_mrec("H1'", h1p, amap["C1'"][2]))
+            if "C2'" in amap and "C1'" in amap and "C3'" in amap and not _has_h("C2'"):
+                if "O2'" in amap:
+                    h2p = _sp3_methine(amap["C2'"][0], amap["C1'"][0], amap["C3'"][0], amap["O2'"][0], d=D_CH_1)
+                    if h2p is not None:
+                        out_atoms.append(_mrec("H2'", h2p, amap["C2'"][2]))
+                else:
+                    h2_pair = _sp3_methylene(amap["C2'"][0], amap["C1'"][0], amap["C3'"][0], d=D_CH_2)
+                    if h2_pair is not None:
+                        out_atoms.append(_mrec("H2'", h2_pair[0], amap["C2'"][2]))
+                        out_atoms.append(_mrec("H2''", h2_pair[1], amap["C2'"][2]))
+            if "C3'" in amap and "C2'" in amap and "C4'" in amap and "O3'" in amap and not _has_h("C3'"):
+                h3p = _sp3_methine(amap["C3'"][0], amap["C2'"][0], amap["C4'"][0], amap["O3'"][0], d=D_CH_1)
+                if h3p is not None:
+                    out_atoms.append(_mrec("H3'", h3p, amap["C3'"][2]))
+            if "C4'" in amap and "C3'" in amap and "O4'" in amap and "C5'" in amap and not _has_h("C4'"):
+                h4p = _sp3_methine(amap["C4'"][0], amap["C3'"][0], amap["O4'"][0], amap["C5'"][0], d=D_CH_1)
+                if h4p is not None:
+                    out_atoms.append(_mrec("H4'", h4p, amap["C4'"][2]))
+            if "C5'" in amap and "C4'" in amap and "O5'" in amap and not _has_h("C5'"):
+                h5_pair = _sp3_methylene(amap["C5'"][0], amap["C4'"][0], amap["O5'"][0], d=D_CH_2)
+                if h5_pair is not None:
+                    out_atoms.append(_mrec("H5'", h5_pair[0], amap["C5'"][2]))
+                    out_atoms.append(_mrec("H5''", h5_pair[1], amap["C5'"][2]))
+
             if "O2'" in amap and "C2'" in amap and not _has_h("O2'"):
                 ref_p = amap["C1'"][0] if "C1'" in amap else None
                 ho2 = _best_rotatable_xh(amap["O2'"][0], amap["C2'"][0], ref_p, D_OH, 109.5, acc_tree, acc_xyz, hv_tree)
                 if ho2 is not None:
-                    out_atoms.append(_make_rec(rseq, rname, "HO2'", ho2, amap["O2'"][2]))
+                    out_atoms.append(_mrec("HO2'", ho2, amap["O2'"][2]))
 
     return out_atoms

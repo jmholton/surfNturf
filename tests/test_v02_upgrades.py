@@ -214,9 +214,9 @@ class TestV02Upgrades(unittest.TestCase):
         P_true = cgrid.sf(rho_true, idx)
         Fo_noisy = np.maximum(np.abs(Q_prot + P_true) + rng.normal(0.0, 6.5, size=n_ref), 0.5)
 
-        targ = ReciprocalTarget(H, Fo_noisy, ~free_m, free_m, Q_prot, np.ones(n_ref), np.zeros(n_ref, dtype=np.int32), 1, d_hkl)
+        targ = ReciprocalTarget(H, Fo_noisy, ~free_m, free_m, Q_prot, np.ones(n_ref), np.zeros(n_ref, dtype=np.int32), 1, d_hkl, spacegroup=sg)
         gated_bmob = fit_bmob_blind_gated(rend, targ, ds, mob_asu, cached, kmask_mode="fixed_one", maxiter=15)
-        self.assertIn(gated_bmob["selected_stage"], ("uniform", "phys", "spatial"))
+        self.assertIn(gated_bmob["selected_stage"], ("0shot", "uniform", "phys"))
         self.assertTrue(np.isfinite(gated_bmob["r_val"]))
 
         # Now feed the exact true base map into `fit_adaptive_divot_peak_blind` on noisy 2.7 A data: must select `'base'`!

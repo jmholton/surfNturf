@@ -29,8 +29,21 @@ class TestSurfNTurfField(unittest.TestCase):
             self.assertTrue(np.all(np.isfinite(theta)))
             if variant.startswith("v1_"):
                 self.assertEqual(spec.n_params, 173)
+                self.assertEqual(spec.n_types, 10)
                 self.assertFalse(spec.use_lp)
                 self.assertFalse(spec.use_tet_oz)
+                self.assertEqual(spec.n_oz_steps, 1)
+                self.assertFalse(spec.use_pauli_cap)
+                self.assertFalse(spec.zero_bulk_offset)
+                self.assertFalse(spec.use_epol)
+            else:
+                self.assertEqual(spec.n_params, 219)
+                self.assertEqual(spec.n_types, 13)
+                self.assertTrue(spec.use_lp)
+                self.assertTrue(spec.use_tet_oz)
+                self.assertEqual(spec.n_oz_steps, 4)
+                self.assertTrue(spec.use_pauli_cap)
+                self.assertTrue(spec.zero_bulk_offset)
                 self.assertFalse(spec.use_epol)
 
     def test_ion_typing_and_multichain_hip(self):
@@ -308,15 +321,20 @@ class TestSurfNTurfField(unittest.TestCase):
     def test_v2_lp_tetoz4_paulicap_zero_bulk_and_optional_epol(self):
         from surfnturf.cli import build_parser
 
-        # Verify +Epol is OFF by default in both WaterFieldSpec and `surfnturf train` CLI
+        # Verify WaterFieldSpec() defaults match shipped v0.2 weights (219 params, +Epol off) & CLI oz_steps auto-resolves
         default_spec = WaterFieldSpec()
+        self.assertEqual(default_spec.n_params, 219)
         self.assertTrue(default_spec.use_lp)
+        self.assertTrue(default_spec.use_tet_oz)
+        self.assertEqual(default_spec.n_oz_steps, 4)
+        self.assertTrue(default_spec.use_pauli_cap)
+        self.assertTrue(default_spec.zero_bulk_offset)
         self.assertFalse(default_spec.use_epol)
         cli_args = build_parser().parse_args(["train", "--dataset", "m.ccp4:p.pdb:5.0", "--out", "w.npz"])
         self.assertFalse(cli_args.epol)
         self.assertFalse(cli_args.no_lp)
         self.assertFalse(cli_args.no_tet_oz)
-        self.assertEqual(cli_args.oz_steps, 4)
+        self.assertIsNone(cli_args.oz_steps)
 
         rng = np.random.default_rng(7)
         cell = gemmi.UnitCell(16.0, 14.0, 12.0, 90.0, 90.0, 90.0)
@@ -412,6 +430,86 @@ class TestSurfNTurfField(unittest.TestCase):
             )
             self.assertLess(float(np.max(np.abs(gh_b - gh_d))), 2e-5)
             self.assertLess(float(np.max(np.abs(gO_b - gO_d))), 2e-5)
+
+        # Verify build_asu_features(grid, members) auto-infers n_types=13 when LP virtual sites are present (V13)
+        Phi_auto, _, _ = build_asu_features(grid, members, max_workers=1)
+        self.assertEqual(Phi_auto.shape[2], default_spec.n_pmf)
+
+    def test_ether_sp3_lone_pairs_charge_balance_and_trainer_roundtrip(self):
+        from surfnturf.hydrogens import complete_conformer_hydrogens
+        from surfnturf.io import save_spec_and_theta, write_ccp4
+        from surfnturf.train import fit_surfnturf_model
+
+        # 1. V15: Dimethyl ether (C1-O-C2) gets O_hyd (2) and two tetrahedral out-of-plane LP_sp3 (12) sites
+        ether_atoms = [
+            (1, "LIG", "C1", "C", [-1.160, 0.800, 0.000]),
+            (1, "LIG", "O1", "O", [0.000,  0.000, 0.000]),
+            (1, "LIG", "C2", "C", [1.160,  0.800, 0.000]),
+        ]
+        x_eth, t_eth = classify_conformer_atoms(ether_atoms, use_lp=True)
+        self.assertEqual(list(t_eth[:3]), [7, 2, 7])
+        self.assertEqual(list(t_eth[3:]), [12, 12])
+        for lp_pos in x_eth[3:]:
+            self.assertGreater(abs(float(lp_pos[2])), 0.45)  # strictly out of the C1-O-C2 z=0 plane
+            self.assertGreater(float(np.linalg.norm(lp_pos - x_eth[0])), 1.65)
+            self.assertGreater(float(np.linalg.norm(lp_pos - x_eth[2])), 1.65)
+
+        # 2. V14: Formal integer charge balance on zwitterionic peptide (NH3+-VAL-GLY-ASP-LYS-SER-COO-, net 0.00 e)
+        zwit_hv = [
+            (1, "VAL", "N", "N", [5.00, 5.00, 5.00]), (1, "VAL", "CA", "C", [6.46, 5.00, 5.00]),
+            (1, "VAL", "C", "C", [7.01, 6.42, 5.00]), (1, "VAL", "O", "O", [6.28, 7.41, 5.00]),
+            (1, "VAL", "CB", "C", [6.98, 4.24, 6.23]), (1, "VAL", "CG1", "C", [8.50, 4.24, 6.28]),
+            (1, "VAL", "CG2", "C", [6.42, 2.82, 6.24]),
+            (2, "GLY", "N", "N", [8.33, 6.51, 5.00]), (2, "GLY", "CA", "C", [8.98, 7.81, 5.00]),
+            (2, "GLY", "C", "C", [10.49, 7.69, 5.00]), (2, "GLY", "O", "O", [11.04, 6.59, 5.00]),
+            (3, "ASP", "N", "N", [11.15, 8.84, 5.00]), (3, "ASP", "CA", "C", [12.60, 8.91, 5.00]),
+            (3, "ASP", "C", "C", [13.15, 10.33, 5.00]), (3, "ASP", "O", "O", [12.42, 11.32, 5.00]),
+            (3, "ASP", "CB", "C", [13.14, 8.16, 6.22]), (3, "ASP", "CG", "C", [14.65, 8.18, 6.25]),
+            (3, "ASP", "OD1", "O", [15.25, 9.26, 6.25]), (3, "ASP", "OD2", "O", [15.22, 7.08, 6.25]),
+            (4, "LYS", "N", "N", [14.47, 10.42, 5.00]), (4, "LYS", "CA", "C", [15.12, 11.72, 5.00]),
+            (4, "LYS", "C", "C", [16.63, 11.60, 5.00]), (4, "LYS", "O", "O", [17.18, 10.50, 5.00]),
+            (4, "LYS", "OXT", "O", [17.25, 12.68, 5.00]),
+            (4, "LYS", "CB", "C", [14.68, 12.51, 3.77]), (4, "LYS", "CG", "C", [15.20, 13.94, 3.75]),
+            (4, "LYS", "CD", "C", [14.76, 14.72, 2.52]), (4, "LYS", "CE", "C", [15.28, 16.15, 2.50]),
+            (4, "LYS", "NZ", "N", [14.85, 16.92, 1.31]),
+        ]
+        zwit_comp = complete_conformer_hydrogens(zwit_hv)
+        _, _, q_zwit = classify_conformer_atoms(zwit_comp, use_lp=False, return_charges=True)
+        # NH3+ (+1) + ASP (-1) + LYS (+1) + COO- (-1) == 0.00 e!
+        self.assertLess(abs(float(np.sum(q_zwit))), 1e-3)
+
+        # 3. save_spec_and_theta + fit_surfnturf_model (both v0.2 219-param default and v0.1 173-param --no-tet-oz)
+        with tempfile.TemporaryDirectory() as td:
+            cell = gemmi.UnitCell(16.0, 16.0, 16.0, 90.0, 90.0, 90.0)
+            sg = gemmi.SpaceGroup("P 21 21 21")
+            pdb_p = os.path.join(td, "mini.pdb")
+            map_p = os.path.join(td, "mini.ccp4")
+            with open(pdb_p, "w", encoding="utf-8", newline="\n") as f:
+                f.write("CRYST1   16.000   16.000   16.000  90.00  90.00  90.00 P 21 21 21    4\n")
+                f.write("ATOM      1  N   ALA A   1       4.000   4.000   4.000  1.00 10.00           N\n")
+                f.write("ATOM      2  CA  ALA A   1       5.460   4.000   4.000  1.00 10.00           C\n")
+                f.write("ATOM      3  C   ALA A   1       6.010   5.420   4.000  1.00 10.00           C\n")
+                f.write("ATOM      4  O   ALA A   1       5.280   6.410   4.000  1.00 11.00           O\n")
+                f.write("ATOM      5  CB  ALA A   1       5.980   3.240   5.230  1.00 12.00           C\nEND\n")
+            grid_t = ASUGrid(cell, sg, (16, 16, 16), step=1)
+            rho_syn = grid_t.asu_to_full_3d(np.full(grid_t.n_asu, 0.30, dtype=np.float64))
+            write_ccp4(map_p, rho_syn, cell, sg)
+
+            npz_v2 = os.path.join(td, "fit_v2.npz")
+            r_v2 = fit_surfnturf_model([("mini", map_p, pdb_p, 5.0)], step=2, maxiter=2, out_npz=npz_v2)
+            self.assertEqual(r_v2["spec"].n_params, 219)
+            self.assertEqual(r_v2["spec"].n_oz_steps, 4)
+            sp_ld, th_ld = load_saved_spec_and_theta(npz_v2)
+            self.assertEqual(sp_ld.n_params, 219)
+            self.assertTrue(np.allclose(th_ld, r_v2["theta"]))
+
+            npz_v1 = save_spec_and_theta(os.path.join(td, "fit_v1"), WaterFieldSpec(n_types=10), np.zeros(173))
+            r_v1 = fit_surfnturf_model(
+                [("mini", map_p, pdb_p, 5.0)], use_lp=False, use_tet_oz=False,
+                use_pauli_cap=False, zero_bulk_offset=False, step=2, maxiter=2, out_npz=npz_v1
+            )
+            self.assertEqual(r_v1["spec"].n_params, 173)
+            self.assertEqual(r_v1["spec"].n_oz_steps, 1)
 
 
 if __name__ == "__main__":

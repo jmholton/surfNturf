@@ -1,4 +1,5 @@
 """High-level prediction, CCP4/MTZ I/O, and ordered-water displacement for surfNturf."""
+import glob
 import os
 import sys
 import numpy as np
@@ -7,7 +8,7 @@ from scipy.spatial import cKDTree
 
 from .data import get_pretrained_weights_path, load_bmob_phys_preset
 from .field import (
-    RHO_BULK, ASUGrid, WaterFieldSpec,
+    RHO_BULK, ASUGrid, WaterFieldSpec, _gemmi_chain_icode,
     classify_conformer_atoms, load_ensemble, forward_direct, solv_to_fpart
 )
 from .bmob import (
@@ -33,6 +34,46 @@ def resolve_crystal_symmetry(cell: gemmi.UnitCell, sg_or_hm, source_desc: str = 
         except Exception as exc:
             raise ValueError(f"{source_desc}: unrecognized space group {sg_hm!r}") from exc
     return cell, sg
+
+
+def read_ccp4_map_checked(map_path: str):
+    """Read a CCP4 map and resolve `(arr_3d, cell, sg, has_explicit_sg)`, warning if header ISPG is missing/zero."""
+    m = gemmi.read_ccp4_map(str(map_path), setup=False)
+    ispg = int(m.header_i32(23))
+    has_sg = (ispg > 0) and (m.grid.spacegroup is not None)
+    m.setup(float("nan"))
+    arr_3d = np.array(m.grid, copy=True, dtype=np.float64)
+    sg_hm = m.grid.spacegroup.hm if (has_sg and m.grid.spacegroup is not None) else ""
+    cell, sg = resolve_crystal_symmetry(m.grid.unit_cell, sg_hm, source_desc=str(map_path))
+    return arr_3d, cell, sg, has_sg
+
+
+def check_crystal_compatibility(cell_a: gemmi.UnitCell, sg_a: gemmi.SpaceGroup, desc_a: str,
+                                cell_b: gemmi.UnitCell, sg_b: gemmi.SpaceGroup, desc_b: str,
+                                rel_tol: float = 0.01, ang_tol: float = 1.0) -> bool:
+    """Warn on stderr if two crystallographic inputs disagree in space group or unit-cell parameters."""
+    ok = True
+    if sg_a is not None and sg_b is not None and sg_a.number != sg_b.number:
+        print(
+            f"surfnturf warning: space group mismatch between {desc_a} ({sg_a.hm!r}, #{sg_a.number}) "
+            f"and {desc_b} ({sg_b.hm!r}, #{sg_b.number})",
+            file=sys.stderr,
+        )
+        ok = False
+    if cell_a is not None and cell_b is not None and cell_a.is_crystal() and cell_b.is_crystal():
+        pa = np.array(cell_a.parameters, dtype=np.float64)
+        pb = np.array(cell_b.parameters, dtype=np.float64)
+        rel_abc = float(np.max(np.abs(pa[:3] - pb[:3]) / np.maximum(0.5 * (pa[:3] + pb[:3]), 1e-6)))
+        max_ang = float(np.max(np.abs(pa[3:] - pb[3:])))
+        if rel_abc > float(rel_tol) or max_ang > float(ang_tol):
+            fmt_a = "({:.2f}, {:.2f}, {:.2f}, {:.1f}, {:.1f}, {:.1f})".format(*pa)
+            fmt_b = "({:.2f}, {:.2f}, {:.2f}, {:.1f}, {:.1f}, {:.1f})".format(*pb)
+            print(
+                f"surfnturf warning: unit-cell mismatch between {desc_a} {fmt_a} and {desc_b} {fmt_b}",
+                file=sys.stderr,
+            )
+            ok = False
+    return ok
 
 
 def choose_sg_grid_shape(cell: gemmi.UnitCell, sg: gemmi.SpaceGroup, grid_spacing: float = 0.45):
@@ -108,10 +149,11 @@ def load_single_alt(pdb_path: str, alt_letter: str, two_type: bool = False,
     al = []
     matched_alt = 0
     seen_alts = set()
-    for ch in st[0]:
+    for ch_idx, ch in enumerate(st[0]):
         for r in ch:
             if r.name in ("HOH", "WAT", "DOD"):
                 continue
+            ch_tag, ic_tag = _gemmi_chain_icode(ch_idx, ch, r)
             for a in r:
                 if a.occ <= 0:
                     continue
@@ -121,7 +163,7 @@ def load_single_alt(pdb_path: str, alt_letter: str, two_type: bool = False,
                 if not alt_s or alt_s == alt_letter:
                     if alt_s == alt_letter:
                         matched_alt += 1
-                    al.append((r.seqid.num, r.name, a.name, a.element.name, a.pos.tolist()))
+                    al.append((r.seqid.num, r.name, a.name, a.element.name, a.pos.tolist(), ch_tag, ic_tag))
     if matched_alt == 0 and seen_alts:
         print(
             f"surfnturf: altloc {alt_letter!r} not found in {pdb_path} (available: {sorted(seen_alts)}); "
@@ -218,9 +260,10 @@ def write_ccp4(path: str, arr_3d: np.ndarray, cell: gemmi.UnitCell, sg: gemmi.Sp
 
 
 def write_fpart_mtz_on_hkl(arr_3d: np.ndarray, cell: gemmi.UnitCell, ref_mtz_path: str, out_mtz_path: str,
-                           col_names=("FPART", "PHIPART")):
+                           col_names=("FPART", "PHIPART"), sg: gemmi.SpaceGroup = None):
     """Direct FFT structure-factor evaluation onto `ref_mtz_path`'s exact Miller indices (Nyquist-safe)."""
     ref_mtz = gemmi.read_mtz_file(ref_mtz_path)
+    check_crystal_compatibility(cell, sg, "solvent map", ref_mtz.cell, ref_mtz.spacegroup, str(ref_mtz_path))
     H = np.array(ref_mtz.make_miller_array(), dtype=np.int64)
     nu, nv, nw = arr_3d.shape
     in_nyq = (
@@ -283,7 +326,9 @@ def write_fpart_mtz_to_dmin(arr_3d: np.ndarray, cell: gemmi.UnitCell, sg: gemmi.
 
 def _sample_structure_for_target(target_path: str) -> gemmi.Structure:
     if os.path.isdir(target_path):
-        pdbs = sorted([os.path.join(target_path, f) for f in os.listdir(target_path) if f.endswith(".pdb")])
+        pdbs = sorted(glob.glob(os.path.join(target_path, "m*.pdb")))
+        if not pdbs:
+            pdbs = sorted(glob.glob(os.path.join(target_path, "*.pdb")))
         if not pdbs:
             raise ValueError(f"No .pdb files found in ensemble directory {target_path!r}")
         return gemmi.read_structure(pdbs[0])

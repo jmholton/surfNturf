@@ -17,7 +17,7 @@ Given any crystallographic structure (single-conformer, `A/B`, heterogeneous mul
 1. **Conformer Completion — *Turf* (`surfnturf.reconnect` or external `m*.pdb` ensembles):**
    Accepts pre-untangled conformer directories (`m01.pdb .. mNN.pdb`) directly, or expands heterogeneous multi-altloc PDB/mmCIF files on the fly into $M$ (default `32`) sterically compatible complete conformers via a fast Kuhn–Munkres Hungarian + interval-cut heuristic (`surfnturf reconnect`), filtering riding-H ghost altlocs, preserving DNA/disulfide/metal/glycan bonds, and re-bisecting cross-letter amide `H/D` atoms.
 2. **10-Class Protonation-Aware Solute–Water PMF + Explicit $sp^2 / sp^3$ Lone Pairs (`182` spline parameters; optional `+Epol`):**
-   Separates explicit polar donor hydrogens (`H_pol` at `1.85 Å`, cationic `H_pos` at `1.78 Å`), nonpolar `C–H` (`H_apol`), anionic carboxylate/coordinating ions (`O_neg`), carbonyl (`O_carb`), hydroxyl/aromatic-acceptor (`O_hyd`), donor `N` / large polar ions (`N_don`), `C_sp2` / `P`, `C_sp3`, and `S_sul` / `Se`—augmented with explicit lone-pair virtual sites at $d_{\text{LP}} = 0.65\text{ \AA}$ (`LP_sp2` at $120^\circ$ on `C=O` / aromatic `N`, `LP_neg` on `COO-`, and tetrahedral `LP_sp3` at $109.47^\circ$ on `OH`) using $C^2$ cardinal cubic B-splines on `[1.40, 5.60 Å]`. Screened AMBER-charge crystal electric-field polarization (`+Epol`, `3` parameters) is also included and off by default (`surfnturf train --epol`).
+   Separates explicit polar donor hydrogens (`H_pol` at `1.85 Å`, cationic `H_pos` at `1.78 Å`), nonpolar `C–H` (`H_apol`), anionic carboxylate/coordinating ions (`O_neg`), carbonyl (`O_carb`), hydroxyl/ether/aromatic-acceptor (`O_hyd`), donor `N` / large polar ions (`N_don`), `C_sp2` / `P`, `C_sp3`, and `S_sul` / `Se`—augmented with explicit lone-pair virtual sites at $d_{\text{LP}} = 0.65\text{ \AA}$ (`LP_sp2` at $120^\circ$ on `C=O` / aromatic `N`, `LP_neg` on `COO-`, and tetrahedral `LP_sp3` at $109.47^\circ$ on `OH` and `C–O–C` / `P–O–C` bridges) using $C^2$ cardinal cubic B-splines on `[1.40, 5.60 Å]`. Screened AMBER-charge crystal electric-field polarization (`+Epol`, `3` parameters) is also included and off by default (`surfnturf train --epol`).
 3. **Grand-Canonical Langmuir Saturation (`1` parameter) + Rosenfeld 0D Cavity Cap (`0` parameters):**
    $$g_1^{(m)}(\mathbf{x}) = \frac{1}{\alpha}\,\sigma\!\left(\ln\frac{\alpha}{1-\alpha} - U_0^{(m)}(\mathbf{x})\right)$$
    Multi-tethered groove waters cooperate multiplicatively while a parameter-free Rosenfeld 0D exclusion cavity cap ($r_{\text{cav}} = 1.30\text{ \AA}$, diameter $2.60\text{ \AA} < d_{\text{OO},\min}$) enforces $\le 1$ water molecule (`~10 e`) per exclusion sphere.
@@ -25,10 +25,10 @@ Given any crystallographic structure (single-conformer, `A/B`, heterogeneous mul
    Iterates $K = 4$ damped self-consistent steps combining 5 radial Gaussian shells (`1.25..4.50 Å`) with exact spherical-harmonic ($l = 0, 1, 2$) Stillinger–Weber / mW 3-body tetrahedral coordination on the `2.80 Å` H-bond shell (with exact analytical empty-bulk offset subtraction so $\bar{g}_O(\infty) \equiv 1.000$), resolving 1- and 2-tethered ordered waters alongside a strictly zero-net-charge (`f_H(0) = 0`) acceptor-directed water-hydrogen polarization term.
 5. **Exact `IT92` `(O + 2H)` Fourier Rendering, `k_mask = 1` 3D Mobility $B(\mathbf{x})$, and Sparse `PeakDict` / `WatershedDivotDict`:**
    * Renders molecular water number density into electron density (`e/Å³`) with International Tables `IT92` oxygen + orientational `2H` (`r_OH = 0.9572 Å`) form factors, conserving `F000` identically.
-   * **`surfnturf.bmob`**: Renders spatially varying water mobility $B(\mathbf{x}) \in [0.625, 2560]\text{ \AA}^2$ via a `13`-level Catmull–Rom partition-of-unity basis on $\ln B$, refined against work-set $|F_{\text{obs}}|$ at strict `k_mask = 1` (`--kmask-mode fixed_one`, eliminating gauge collinearity between $B(\mathbf{x})$ and per-shell $k_{\text{mask}}(s)$).
-   * **`surfnturf.divot`**: Captures crystal-specific interstitial cavities, cryoprotectant/ion pockets, and sub-voxel hydration peaks from exact `e/Å³` work-set `mFo - DFc` maps via continuous-coordinate `IT92` peaks (`ContinuousPeakDict`), Bader steepest-ascent basins (`WatershedDivotDict`), or wall-clamped mass-conserving transport (`W_mc`), with strict blind hyperparameter selection on an internal `5%` work-validation split (`FreeR_flag == 0` is never touched).
+   * **`surfnturf.bmob`**: Renders spatially varying water mobility $B(\mathbf{x}) \in [0.625, 2560]\text{ \AA}^2$ via a `13`-level Catmull–Rom partition-of-unity basis on $\ln B$, refined against work-set $|F_{\text{obs}}|$ with a single resolution-independent mother-liquor density scalar $k_{\text{bulk}} = \rho_{\text{mother}} / \rho_{\text{water}} \in [0.65, 1.50]$ (`--kmask-mode global_scalar`, or strict pure-water `--kmask-mode fixed_one`, eliminating gauge collinearity between $B(\mathbf{x})$ and per-shell $k_{\text{mask}}(s)$).
+   * **`surfnturf.divot`**: Captures crystal-specific interstitial cavities, cryoprotectant/ion pockets, and sub-voxel hydration peaks from exact `e/Å³` work-set `mFo - DFc` maps via continuous-coordinate `IT92` peaks (`ContinuousPeakDict`), Bader steepest-ascent basins (`WatershedDivotDict`), or wall-clamped mass-conserving transport (`W_mc`), with strict blind hyperparameter selection on an internal `5%` work-validation split (the R-free test set is never touched).
 
-Every layer has **exact hand-derived analytical reverse-mode adjoints** (BLAS `DGEMV` + Parseval 3D FFTs, verified against central finite differences to `1e-10`–`5e-7`). For full mathematical derivations of all six layers, see [PHYSICAL_PRINCIPLES.md](PHYSICAL_PRINCIPLES.md).
+Every layer has **exact hand-derived analytical reverse-mode adjoints** (BLAS `DGEMV` + Parseval 3D FFTs, verified against central finite differences to `1e-10`–`1e-6` across float64 layers and `< 2e-4` with float32 BLAS feature caching). For full mathematical derivations of all six layers, see [PHYSICAL_PRINCIPLES.md](PHYSICAL_PRINCIPLES.md).
 
 ---
 
@@ -90,16 +90,16 @@ surfnturf reconnect model_multialt.pdb out/members --nconf 32
 ```
 
 ### 3. Work-Set X-Ray Mobility $B(\mathbf{x})$ & Sparse Peak/Divot Refinement
-First export a 0-cycle `*_f_model.mtz` from `phenix.refine` with `output.export_final_f_model=True` (providing `FOBS`, `R_FREE_FLAGS`, `FCALC`, `PHIFCALC`, `FMASK`, `PHIFMASK`, `FMODEL`, `PHIFMODEL`, `K_MASK`, and `K_ISOTROPIC`/`K_ANISOTROPIC`). Both `fit-bmob` and `fit-divot` share a deterministic `90% work_train / 5% work_val / 5% FreeR==0` split, automatically complete missing riding hydrogens on H-less/partial-H PDBs, scale spatial `B(x)` smoothing with resolution (`--fwhm auto` $\to \max(3.2\text{ \AA}, 3.5\,d_{\min})$), and gate stage complexity on unseen `5% work_val` (`FreeR_flag == 0` is never touched):
+First export a 0-cycle `*_f_model.mtz` from `phenix.refine` with `output.export_final_f_model=True` (providing `FOBS`, `R_FREE_FLAGS`, `FCALC`, `PHIFCALC`, `FMASK`, `PHIFMASK`, `FMODEL`, `PHIFMODEL`, `K_MASK`, and `K_ISOTROPIC`/`K_ANISOTROPIC`). Both `fit-bmob` and `fit-divot` share a deterministic `90% work_train / 5% work_val / 5% R-free` split (supporting `0..19` CCP4, `0/1`, SHELX `-1/1`, or `--free-flag-value`), automatically complete missing riding hydrogens across multi-chain / insertion-code PDBs, scale spatial `B(x)` smoothing with resolution (`--fwhm auto` $\to 3.2\text{ \AA}$ for $d_{\min} \le 1.0\text{ \AA}$, $\max(3.2\text{ \AA}, 3.5\,d_{\min})$ at lower resolution), and gate stage complexity on unseen `5% work_val` (the R-free test set is never touched):
 
 ```bash
-# Blind work_val-gated 3D water mobility B(x) on 90% work_train |Fo| (default --mode auto):
+# Blind work_val-gated 3D water mobility B(x) on 90% work_train |Fo| (default --mode auto, global_scalar mother-liquor density):
 surfnturf fit-bmob --pdb model.pdb --fmodel-mtz score_001_f_model.mtz --data-mtz refme.mtz --out out/bmob
 
 # Or joint 3D water mobility B(x) + PMF refinement on work |Fo|:
 surfnturf fit-bmob --pdb model.pdb --fmodel-mtz score_001_f_model.mtz --data-mtz refme.mtz --out out/bmob_joint --mode joint
 
-# Blind work_val-gated sparse PeakDict + WatershedDivotDict refinement (FreeR_flag==0 untouched):
+# Blind work_val-gated sparse PeakDict + WatershedDivotDict refinement (R-free test set untouched):
 surfnturf fit-divot --pdb model.pdb --fmodel-mtz score_001_f_model.mtz --data-mtz refme.mtz --base-ccp4 out/bmob_solvent.ccp4 --out out/hybrid --arm hybrid
 ```
 
@@ -119,17 +119,21 @@ surfnturf.write_fpart_mtz_to_dmin(solv_3d, cell, sg, dmin=1.0, out_mtz_path="sol
 
 ## Benchmarks
 
-1. **Zero-shot cross-trajectory & cross-$B$ generalization against 32-conformer explicit-water AMBER MD maps (`1aho`, `1.2–6.0 Å` shell):**
-   * Increases unseen-trajectory real-space correlation from `CC = 0.72` (2-type `N/O` vs `C/S` Gaussian baseline) to **`CC = 0.875–0.881`** across all 4 trajectories (`RMSE = 0.068–0.095 e/Å³`), outperforming periodic 32-conformer `AMBER22 3D-RISM KH` (`< 3 Å` shell `CCv = +0.70` vs `-0.16`).
-2. **Ground-truth diffraction benchmark (`1aho`, `FreeR_flag == 0` untouched):**
+All v0.2 numbers below use the default 219-parameter `l2` weights (`pmf_full_l2.npz`, `Epol` off; legacy 173-parameter v0.1 weights remain bundled as `--weights v1_l2` / `v1_kl`):
+
+1. **Zero-shot MD hydration & ordered-water stoichiometry (`1aho` 32-conformer explicit-water AMBER MD & `1AHO.pdb` `129` deposited waters):**
+   * Cross-trajectory 10-class hydration correlation increases from `CC = 0.72` (2-type `N/O` vs `C/S` Gaussian baseline) to **`CC = 0.875–0.881`** across all 4 trajectories (`RMSE = 0.068–0.095 e/Å³`), outperforming periodic 32-conformer `AMBER22 3D-RISM KH` (`< 3 Å` shell `CCv = +0.70` vs `-0.16`), with exact empty-cell asymptote $\bar{g}_O(\infty) = 1.000000000$.
+   * Adding explicit lone pairs + 4-step tetrahedral closure + Rosenfeld 0D cavity cap (`v0.2 l2` vs `v1_l2`) doubles 1-tethered ordered-water peak density (`HOH 113` on `Gly34 O`: `1.08 → 2.28 e/Å³`; `25` `1-HB` waters median `1.22 → 2.20 e/Å³`, integrated `5.5 → 7.5 e`) while holding 3-tethered `HOH 108` to physical 1-water stoichiometry (`8.8 e`, `B_pocket = 5.1 Å²`).
+2. **Ground-truth synthetic diffraction benchmark (`1aho`, `v1_l2` base, R-free test set untouched):**
    * Zero-MD `surfNturf` + `3.2 Å B(x)` + `Hybrid (Divot + PeakDict)` reaches **`R_true_free = 7.12%`** (`E_solv = 0.336`), matching a 50 ns explicit-water MD start + `Hybrid` (`7.09%`, `E_solv = 0.332`).
    * Over 30 macrocycles of `phenix.refine`, zero-MD `surfNturf` + `PeakDict` achieves `R_work / R_free = 7.03% / 8.91%`, `R_true_free = 8.45%`, and heavy-atom `RMSD = 0.0606 Å` (`max 0.337 Å`), outperforming 50 ns MD + Fourier shift-and-scale (`7.84% / 10.44%`, `R_true_free = 10.16%`).
-3. **Real `1aho` experimental diffraction (`0.96 Å`, `P 21 21 21`, `0`-cycle common ruler on `1aho_best_so_far_trimmed.pdb`, `DRY` = `0` coordinate waters, `0` MD):**
-   * Drops `R_work / R_free` from `17.22% / 17.93%` (Phenix flat mask) → `13.26% / 14.21%` (`surfNturf` uniform `B = 5 Å²`) → `11.18% / 13.08%` (`+ 3.2 Å B(x)`) → **`9.25% / 11.09%`** (`+ 3.2 Å B(x)` + blind `PeakDict`), surpassing `DRY` water-restrained 2019 MD (`10.03% / 11.79%`) and `DRY` iterative map solvent (`9.98% / 11.96%`).
-4. **Cross-protein, cross-space-group, sub-atomic generalization on `8C5N` (`0.75 Å`, monoclinic `P 1 21 1`, $\beta = 99.25^\circ$, `186` residues, `198,461` reflections, `9,968` `FreeR_flag == 0` reflections untouched; `1aho` MD weights frozen):**
-   * **Zero-shot water-site recall (`161` experimental `0.75 Å` waters):** `98.8%` sterically allowed (`cannot < 0.2`), `95.0%` at `want > 1.2`, with median $g_O = 6.42$ (`mean = 11.04`, `90th percentile = 24.82` vs open-solvent mean `1.40`).
-   * **`DRY` (`0` coordinate `HOH` in PDB):** `21.22% / 21.72%` (Phenix flat mask) → `19.26% / 19.77%` (0-shot `surfNturf`, `-4.04%` in `3.5–1.8 Å`) → `17.69% / 18.49%` (`+ 3.2 Å B(x)`) → **`12.18% / 13.49%`** (`+ blind Hybrid`), **beating the deposited `161`-water `WET` model + flat mask (`14.60% / 15.53%`) by `-2.04%` `R_free` with zero coordinate waters**.
-   * **`WET` (`161` deposited `HOH` + `CL` + `ANISOU` untouched):** `15.40% / 16.30%` (PDB header) → `14.60% / 15.53%` (Phenix flat mask) → `13.96% / 14.86%` (0-shot `surfNturf`) → **`11.08% / 12.69%`** (`+ 3.2 Å B(x) + blind Hybrid`, `-2.84%` overall `R_free` vs Phenix flat mask and `-5.19%` in `3.5–1.8 Å`).
+3. **Real `1aho` experimental diffraction (`0.96 Å`, `P 21 21 21`, `0`-cycle `phenix.refine` common ruler on `1aho_best_so_far_trimmed.pdb`, `0` MD, v0.2 `l2`):**
+   * **`DRY` (`0` coordinate waters):** `17.22% / 17.93%` (Phenix flat mask) → **`13.01% / 13.98%`** (0-shot `surfNturf` `B = 5 Å²`; `v1_l2`: `13.26% / 14.19%`) → **`11.97% / 13.50%`** (`fit-bmob --mode auto`, strict `k_mask = 1`) or **`11.23% / 12.71%`** (`--mode joint`) → **`9.75% / 12.04%`** (`+ fit-divot --arm hybrid`, 2-pass `90/5/5` blind `work_val`-gated).
+   * **`WET` (ordered waters displaced):** **`11.70% / 12.94%`** (0-shot `surfNturf` `B = 5 Å²`; `v1_l2`: `11.79% / 13.01%`).
+4. **Cross-protein, cross-space-group, sub-atomic generalization on `8C5N` (`0.75 Å`, monoclinic `P 1 21 1`, $\beta = 99.25^\circ$, `186` residues, `198,461` reflections, `9,968` R-free test reflections untouched; `1aho` MD weights frozen, v0.2 `l2`):**
+   * **Zero-shot water-site recall (`161` experimental `0.75 Å` waters):** `98.8%` sterically allowed (`cannot < 0.2`), **`95.7%` at `want > 1.2`** (`93.2%` at `want > 1.5`), with **median $g_O = 10.18\times$** (`mean = 15.47×`, `90th percentile = 34.48×` vs open-solvent mean `1.59×`; up from median `6.54×` in `v1_l2`).
+   * **`DRY` (`0` coordinate `HOH` in PDB):** `21.22% / 21.72%` (Phenix flat mask) → **`19.04% / 19.57%`** (0-shot `surfNturf`; `19.09% / 19.58%` directly from H-less `8c5n_dry.pdb` via built-in riding-H completion; `v1_l2`: `19.25% / 19.79%`) → **`17.29% / 18.28%`** (`fit-bmob --mode auto`, `k_mask = 1`) / **`15.90% / 16.52%`** (`--mode joint`) → **`12.16% / 13.53%`** (`+ fit-divot --arm hybrid`), **beating the deposited `161`-water `WET` model + flat mask (`14.60% / 15.53%`) by `-2.00%` `R_free` with zero coordinate waters**.
+   * **`WET` (`161` deposited `HOH` + `CL` + `ANISOU` untouched):** `15.40% / 16.30%` (PDB header) → `14.60% / 15.53%` (Phenix flat mask) → **`14.06% / 15.00%`** (0-shot `surfNturf`; `v1_l2`: `13.96% / 14.86%`) → **`13.28% / 14.34%`** (`fit-bmob --mode auto`, `k_mask = 1`) → **`11.02% / 12.59%`** (`+ fit-divot --arm hybrid`, **`-2.94%` overall `R_free` vs Phenix flat mask**).
 
 ---
 

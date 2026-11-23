@@ -152,7 +152,7 @@ class TestSurfNTurfDivot(unittest.TestCase):
             F_bl = np.fft.rfftn(raw_sym)
             F_bl[cg.stol2_r > 1.0 / (4.0 * 2.65 * 2.65)] = 0.0
             F_bl[0, 0, 0] = 0.0
-            delta_true = cg.sym_s(np.fft.irfftn(F_bl, s=shape))
+            delta_true = cg.sym_s(np.fft.irfftn(F_bl, s=shape, axes=(0, 1, 2)))
 
             def _eval_exact_diffmap(cgrid_cur, sg_cur):
                 gg = gemmi.FloatGrid(*shape)
