@@ -1,6 +1,6 @@
 """surfNturf: Differentiable multi-conformer crystal hydration (Surf), conformer reconnection (Turf), 3D water mobility B(x), and X-ray solvent modelling."""
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 from .data import get_pretrained_weights_path, load_bmob_phys_preset
 from .reconnect import reconnect_pdb_to_conformers, write_member_pdbs
@@ -80,12 +80,14 @@ try:
         PeriodicFourierFields,
         ContinuousPeakDict,
         WatershedDivotDict,
+        VacuumConservingHazeField,
         SolventAmplitudeProblem,
         build_open_solvent_envelope,
         pick_asu_difference_peaks,
         extract_problem_from_fmodel,
         fit_periodic_arm,
         fit_adaptive_divot_peak_blind,
+        fit_haze_arm_blind,
         write_fpart_cgrid,
     )
     from .chemfit import (
@@ -182,12 +184,14 @@ __all__ = [
     "PeriodicFourierFields",
     "ContinuousPeakDict",
     "WatershedDivotDict",
+    "VacuumConservingHazeField",
     "SolventAmplitudeProblem",
     "build_open_solvent_envelope",
     "pick_asu_difference_peaks",
     "extract_problem_from_fmodel",
     "fit_periodic_arm",
     "fit_adaptive_divot_peak_blind",
+    "fit_haze_arm_blind",
     "write_fpart_cgrid",
     "CHEM_KNOB_NAMES",
     "CrystalChemAdapter",

@@ -1937,13 +1937,14 @@ def forward_and_grad(spec: WaterFieldSpec, ds: DatasetBundle, theta, ds_index=0,
     gO_bar = mw @ gO_m
     gH_bar = (mw @ gH_m) if gH_m is not None else None
 
+    w_fft = max(1, min(8, int(os.environ.get('OMP_NUM_THREADS', '4'))))
     if spec.use_blur:
         gO_3d = grid.asu_to_full_3d(gO_bar)
-        F_elec = ds.Kw * np.fft.rfftn(grid.n_bulk * gO_3d, axes=(0, 1, 2))
+        F_elec = ds.Kw * sp_fft.rfftn(grid.n_bulk * gO_3d, axes=(0, 1, 2), workers=w_fft)
         if gH_bar is not None:
             gH_3d = grid.asu_to_full_3d(gH_bar)
-            F_elec = F_elec + ds.Kh * np.fft.rfftn(grid.n_bulk * gH_3d, axes=(0, 1, 2))
-        rho_3d = np.fft.irfftn(F_elec, s=grid.shape, axes=(0, 1, 2))
+            F_elec = F_elec + ds.Kh * sp_fft.rfftn(grid.n_bulk * gH_3d, axes=(0, 1, 2), workers=w_fft)
+        rho_3d = sp_fft.irfftn(F_elec, s=grid.shape, axes=(0, 1, 2), workers=w_fft)
         g_hat_base = grid.full_3d_to_asu_mean(rho_3d) / RHO_BULK
     else:
         F_elec = None
@@ -1985,11 +1986,11 @@ def forward_and_grad(spec: WaterFieldSpec, ds: DatasetBundle, theta, ds_index=0,
 
     if spec.use_blur:
         g_rho_3d = grid.asu_to_full_3d((dL_dbase / RHO_BULK) / grid.orbit_mult)
-        F_grho = np.fft.rfftn(g_rho_3d, axes=(0, 1, 2))
-        grad_gO_3d = grid.n_bulk * np.fft.irfftn(ds.Kw * F_grho, s=grid.shape, axes=(0, 1, 2))
+        F_grho = sp_fft.rfftn(g_rho_3d, axes=(0, 1, 2), workers=w_fft)
+        grad_gO_3d = grid.n_bulk * sp_fft.irfftn(ds.Kw * F_grho, s=grid.shape, axes=(0, 1, 2), workers=w_fft)
         dL_dgO_bar = grid.full_3d_to_asu_grad(grad_gO_3d)
         if gH_bar is not None:
-            grad_gH_3d = grid.n_bulk * np.fft.irfftn(ds.Kh * F_grho, s=grid.shape, axes=(0, 1, 2))
+            grad_gH_3d = grid.n_bulk * sp_fft.irfftn(ds.Kh * F_grho, s=grid.shape, axes=(0, 1, 2), workers=w_fft)
             dL_dgH_bar = grid.full_3d_to_asu_grad(grad_gH_3d)
         else:
             dL_dgH_bar = None

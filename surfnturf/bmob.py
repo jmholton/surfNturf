@@ -1136,7 +1136,7 @@ class ReciprocalTarget:
     """Holds work/train/val/free reflections, fixed atomic F_calc, Phenix k_total, and bins for |Fo| fitting."""
 
     def __init__(self, hkl, f_obs, work_mask, free_mask, f_calc, k_tot, bin_idx, n_bins, d_hkl,
-                 train_mask=None, val_mask=None, f_model_ref=None, spacegroup=None):
+                 train_mask=None, val_mask=None, f_model_ref=None, spacegroup=None, k_aniso=None):
         self.hkl = np.ascontiguousarray(hkl, dtype=np.int64)
         self.f_obs = np.ascontiguousarray(f_obs, dtype=np.float64)
         self.work_mask = np.asarray(work_mask, dtype=bool)
@@ -1144,6 +1144,11 @@ class ReciprocalTarget:
         assert not np.any(self.work_mask & self.free_mask), "FREE SET LEAK IN WORK_MASK!"
         self.f_calc = np.ascontiguousarray(f_calc, dtype=np.complex128)
         self.k_tot = np.ascontiguousarray(k_tot, dtype=np.float64)
+        if k_aniso is not None:
+            ka = np.asarray(k_aniso, dtype=np.float64)
+            self.k_aniso = np.ascontiguousarray(np.where(np.isfinite(ka) & (ka > 0.0), ka, 1.0), dtype=np.float64)
+        else:
+            self.k_aniso = np.ones_like(self.k_tot)
         self.bin_idx = np.ascontiguousarray(bin_idx, dtype=np.int32)
         self.n_bins = int(n_bins)
         self.d_hkl = np.ascontiguousarray(d_hkl, dtype=np.float64)
@@ -1167,7 +1172,7 @@ class ReciprocalTarget:
             hkl=self.hkl, f_obs=self.f_obs, work_mask=use_tr, free_mask=self.free_mask,
             f_calc=self.f_calc, k_tot=self.k_tot, bin_idx=self.bin_idx, n_bins=self.n_bins,
             d_hkl=self.d_hkl, train_mask=use_tr, val_mask=self.val_mask, f_model_ref=self.f_model_ref,
-            spacegroup=self.spacegroup,
+            spacegroup=self.spacegroup, k_aniso=self.k_aniso,
         )
 
     def _solve_global_scalar_k0_kb(self, f_part, sel_mask, kb_bounds=(0.65, 1.50), k0_bounds=(0.50, 1.50)):
@@ -1290,6 +1295,88 @@ class ReciprocalTarget:
             return float('nan')
         return float(np.sum(np.abs(np.abs(self.f_model_ref[self.val_mask]) - self.f_obs[self.val_mask])) / denom)
 
+    def eval_unscaled_k1(self, f_part, n_iso_bins: int = 11) -> dict:
+        """Unconfounded strict `k_mask = 1.000` crystallographic ruler (`VACUUM_OFFSET_ANALYSIS.md` §4.1).
+
+        Forms `U(h) = k_aniso(h) * (F_calc(h) + 1.0 * F_part(h))` with ZERO solvent rescaling (`k_mask(h) == 1`,
+        zero vacuum pedestal, zero `k_mask`-induced phase shift `Delta phi == 0.00 deg`), and fits Phenix-style
+        logarithmic-resolution `k_iso(s)` shells strictly on `work_mask | val_mask` (never touching `free_mask`),
+        plus the 1-scalar `k0` unscaled ruler (`r_work_1k / r_free_1k`) and resolution-shell breakdown.
+        """
+        wk = self.work_mask | self.val_mask
+        fr = self.free_mask
+        assert not np.any(wk & fr), "FREE SET LEAK IN eval_unscaled_k1!"
+
+        u_aniso = self.k_aniso * (self.f_calc + np.asarray(f_part, dtype=np.complex128))
+        au = np.abs(u_aniso)
+
+        # 1. Single overall scalar k0 (strict 1-k unscaled ruler):
+        den_1k = max(float(np.sum(au[wk] ** 2)), 1e-12)
+        k0_1k = float(np.clip(float(np.sum(au[wk] * self.f_obs[wk])) / den_1k, 0.25, 4.0))
+        afm_1k = k0_1k * au
+
+        # 2. Logarithmic-resolution (Phenix-style ln d) per-bin k_iso(s) with k_mask(h) === 1.000:
+        nb = max(1, int(n_iso_bins))
+        ln_d = np.log(np.maximum(self.d_hkl, 0.10))
+        d_hi, d_lo = float(np.min(ln_d[wk])), float(np.max(ln_d[wk]))
+        # Reverse order so bin 0 is lowest-resolution (near-beamstop) and bin nb-1 is highest-resolution, matching Phenix
+        edges = np.linspace(d_lo + 1e-9, d_hi - 1e-9, nb + 1)
+        iso_bin = np.clip(np.searchsorted(-edges, -ln_d, side='right') - 1, 0, nb - 1)
+
+        k_iso_bins = np.ones(nb, dtype=np.float64)
+        for b in range(nb):
+            mb = wk & (iso_bin == b)
+            if not np.any(mb):
+                k_iso_bins[b] = k0_1k
+            else:
+                db = float(np.sum(au[mb] ** 2))
+                k_iso_bins[b] = float(np.clip(float(np.sum(au[mb] * self.f_obs[mb])) / max(db, 1e-12), 0.25, 4.0))
+        afm_kiso = k_iso_bins[iso_bin] * au
+
+        def _r_pair(pred, sel_m):
+            m_w = wk & sel_m
+            m_f = fr & sel_m
+            sw = float(np.sum(self.f_obs[m_w])) if np.any(m_w) else 0.0
+            sf = float(np.sum(self.f_obs[m_f])) if np.any(m_f) else 0.0
+            rw = float(np.sum(np.abs(pred[m_w] - self.f_obs[m_w])) / sw) if sw > 0.0 else float('nan')
+            rf = float(np.sum(np.abs(pred[m_f] - self.f_obs[m_f])) / sf) if sf > 0.0 else float('nan')
+            return rw, rf, int(np.sum(m_w)), int(np.sum(m_f))
+
+        all_m = np.ones(len(self.d_hkl), dtype=bool)
+        rw_kiso, rf_kiso, _, _ = _r_pair(afm_kiso, all_m)
+        rw_1k, rf_1k, _, _ = _r_pair(afm_1k, all_m)
+
+        shell_defs = [
+            (">10.0A", self.d_hkl > 10.0),
+            ("10.0-6.0A", (self.d_hkl <= 10.0) & (self.d_hkl > 6.0)),
+            ("6.0-3.0A", (self.d_hkl <= 6.0) & (self.d_hkl > 3.0)),
+            ("3.0-1.5A", (self.d_hkl <= 3.0) & (self.d_hkl > 1.5)),
+            ("<=1.5A", self.d_hkl <= 1.5),
+        ]
+        shells = {}
+        for s_lbl, s_m in shell_defs:
+            if np.any(s_m):
+                srw, srf, nw, nf = _r_pair(afm_kiso, s_m)
+                srw1, srf1, _, _ = _r_pair(afm_1k, s_m)
+                shells[s_lbl] = {
+                    "n_work": nw, "n_free": nf,
+                    "r_work_kiso": round(srw, 5) if np.isfinite(srw) else None,
+                    "r_free_kiso": round(srf, 5) if np.isfinite(srf) else None,
+                    "r_work_1k": round(srw1, 5) if np.isfinite(srw1) else None,
+                    "r_free_1k": round(srf1, 5) if np.isfinite(srf1) else None,
+                }
+
+        return {
+            "r_work_k1_kiso": round(float(rw_kiso), 5),
+            "r_free_k1_kiso": round(float(rf_kiso), 5) if np.isfinite(rf_kiso) else None,
+            "r_work_k1_1scalar": round(float(rw_1k), 5),
+            "r_free_k1_1scalar": round(float(rf_1k), 5) if np.isfinite(rf_1k) else None,
+            "k0_1scalar": round(float(k0_1k), 5),
+            "k_iso_bin1": round(float(k_iso_bins[0]), 5),
+            "k_iso_bins": [round(float(x), 5) for x in k_iso_bins],
+            "shells": shells,
+        }
+
     def eval_loss_grad_and_r(self, f_part, k_bounds=(0.0, 3.0), kmask_mode: str = 'per_bin'):
         w = self.work_mask
         fr = self.free_mask
@@ -1352,6 +1439,8 @@ def multiB_fpart_loss_and_grad(
     compute_grad=True,
     use_f32_blas=True,
     kmask_mode='per_bin',
+    lam_f000: float = 0.0,
+    target_mean_eA3: float = None,
 ):
     """Evaluate reciprocal-space work-set loss, R_work/R_free, solv_3d, and exact analytical gradients."""
     grid = ds.grid
@@ -1386,6 +1475,18 @@ def multiB_fpart_loss_and_grad(
     f_part = solv_to_fpart(solv_3d, grid.cell.volume, target.hkl)
     loss, dL_dF, r_work, r_free, k_bins = target.eval_loss_grad_and_r(f_part, kmask_mode=kmask_mode)
 
+    w_cell = None
+    dm_f000 = 0.0
+    ref_eA3 = 1.0
+    use_f000 = (float(lam_f000) > 0.0) and (target_mean_eA3 is not None)
+    if use_f000:
+        w_cell = grid.orbit_mult.astype(np.float64) / float(grid.nvox)
+        g_pos = np.maximum(g_eff_asu, 0.0) if clamp_nonneg else g_eff_asu
+        cur_mean_eA3 = float(np.dot(w_cell, g_pos) * RHO_BULK)
+        ref_eA3 = max(float(target_mean_eA3), 0.01)
+        dm_f000 = (cur_mean_eA3 - float(target_mean_eA3)) / ref_eA3
+        loss = float(loss) + 0.5 * float(lam_f000) * (dm_f000 * dm_f000)
+
     if not compute_grad:
         return {
             'loss': loss, 'r_work': r_work, 'r_free': r_free,
@@ -1394,6 +1495,9 @@ def multiB_fpart_loss_and_grad(
         }
 
     dL_dg_eff = fpart_grad_to_asu(grid, g_eff_asu, target.hkl, dL_dF, clamp_nonneg=clamp_nonneg)
+    if use_f000:
+        act_pos = (g_eff_asu > 0.0).astype(np.float64) if clamp_nonneg else 1.0
+        dL_dg_eff = dL_dg_eff + (float(lam_f000) * dm_f000 * (RHO_BULK / ref_eA3)) * w_cell * act_pos
     dL_dghat = (dL_dg_eff * keep_asu) if (displace_mode == 'post' and keep_asu is not None) else dL_dg_eff
 
     dL_dgO_m, dL_dgH_m, dL_dz_raw_m, dL_dlogk = pb_render(dL_dghat)
@@ -1523,15 +1627,26 @@ def fit_spatial_bmob_on_work(renderer, target, ds, z_base_m, cached_pmf, fwhm_A=
 
 
 def fit_joint_pmf_and_bmob_on_work(renderer, target, ds, spec, theta_init, mob_feat, psi_init,
-                                   eta_init=None, fwhm_A='auto', lam_z='auto', lam_md=2e-5,
-                                   displace_mode='none', keep_asu=None, kmask_mode='per_bin', maxiter=45):
-    """Two-block well-conditioned optimization of (theta_PMF, psi_phys) + res-scaled spatial dz_asu on work |Fo|."""
+                                   eta_init=None, fwhm_A='auto', lam_z='auto', lam_md=2e-5, lam_f000=0.05,
+                                   displace_mode='none', keep_asu=None, kmask_mode='fixed_one', maxiter=45):
+    """Two-block well-conditioned optimization of (theta_PMF, psi_phys) + res-scaled spatial dz_asu on work |Fo|.
+
+    Defaults to `kmask_mode='fixed_one'` with unit-cell `F000_solv` conservation (`lam_f000=0.05`) so PMF splines
+    redistribute hydration without trading amplitude against per-shell `k_mask(s)` vacuum pedestals.
+    """
     grid = ds.grid
     d_min_t = float(np.min(target.d_hkl)) if len(target.d_hkl) else 0.965
     fwhm_eff, lam_eff = resolution_scaled_bmob_hyperparams(d_min_t, fwhm_A=fwhm_A, lam_z=lam_z)
     phys_spec = PhysicalBMobSpec()
     smoother = SpatialSmoother3D(grid, fwhm_A=fwhm_eff)
     dz_fixed = smoother.forward(eta_init) if eta_init is not None else np.zeros(grid.n_asu, dtype=np.float64)
+
+    z_p0, _, _ = phys_spec.forward_with_pullback(mob_feat, psi_init)
+    out_init = multiB_fpart_loss_and_grad(
+        renderer, target, ds, z_p0 + dz_fixed[None, :], spec=spec, theta=theta_init,
+        displace_mode=displace_mode, keep_asu=keep_asu, compute_grad=False, kmask_mode=kmask_mode,
+    )
+    init_mean_eA3 = float(np.mean(out_init['solv_3d']))
 
     n_th = spec.n_params
     tp_bounds = param_bounds(spec) + phys_spec.bounds()
@@ -1543,7 +1658,8 @@ def fit_joint_pmf_and_bmob_on_work(renderer, target, ds, spec, theta_init, mob_f
         z_p, _, pb_p = phys_spec.forward_with_pullback(mob_feat, ps)
         out = multiB_fpart_loss_and_grad(
             renderer, target, ds, z_p + dz_fixed[None, :], spec=spec, theta=th,
-            displace_mode=displace_mode, keep_asu=keep_asu, compute_grad=True, kmask_mode=kmask_mode
+            displace_mode=displace_mode, keep_asu=keep_asu, compute_grad=True, kmask_mode=kmask_mode,
+            lam_f000=lam_f000, target_mean_eA3=init_mean_eA3,
         )
         pen_sm, g_sm = smoothness_penalty_and_grad(spec, th, lam_pmf=8e-5, lam_hpol=8e-5, lam_oz=3e-5)
         diff_th = th - theta_init
@@ -1778,11 +1894,13 @@ def load_reciprocal_target_from_fmodel_mtz(fmodel_mtz_path: str, n_bins: int = 2
         hkl[valid], d_hkl[valid], free_mask[valid],
         data_mtz_path=data_mtz_path, free_flag_col=free_flag_col, spacegroup=sg,
     )
+    k_aniso_v = k_aniso[valid].astype(np.float64) if k_aniso is not None else None
     target = ReciprocalTarget(
         hkl=hkl[valid], f_obs=f_obs[valid],
         work_mask=work_mask[valid], free_mask=free_mask[valid],
         f_calc=f_calc[valid], k_tot=k_tot[valid],
         bin_idx=bin_idx[valid], n_bins=int(n_bins), d_hkl=d_hkl[valid],
         train_mask=train_v, val_mask=val_v, f_model_ref=f_model[valid], spacegroup=sg,
+        k_aniso=k_aniso_v,
     )
     return target, cell, sg

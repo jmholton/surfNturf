@@ -6,7 +6,7 @@ import gemmi
 from scipy.optimize import minimize
 
 from .field import (
-    ASUGrid, DatasetBundle, WaterFieldSpec, load_ensemble, build_asu_features,
+    RHO_BULK, ASUGrid, DatasetBundle, WaterFieldSpec, load_ensemble, build_asu_features,
     forward_and_grad, smoothness_penalty_and_grad, param_bounds
 )
 from .io import (
@@ -61,18 +61,53 @@ def load_ccp4_map_and_grid(map_path: str, step: int = 2):
         return grid, res_arr
 
 
+def _make_voxel_plus_f000_loss(ds: DatasetBundle, loss_mode: str, lam_f000: float, target_mean_eA3=None):
+    """Build exact analytical `(loss, dL_dghat)` combining voxel L2/KL with unit-cell F000 conservation."""
+    w_asu = ds.weights_asu
+    inv_w = 1.0 / ds.w_sum
+    target = ds.g_asu
+    w_cell = ds.grid.orbit_mult.astype(np.float64) / float(ds.grid.nvox)
+    g_mean_targ = (float(target_mean_eA3) / RHO_BULK) if target_mean_eA3 is not None else float(np.dot(w_cell, target))
+    lam_f = float(lam_f000)
+
+    def _loss_and_grad(g_hat: np.ndarray):
+        if loss_mode == "kl":
+            eps = 1e-4
+            rad = np.hypot(g_hat, eps)
+            g_tilde = 0.5 * (g_hat + rad)
+            dg_tilde = 0.5 * (1.0 + g_hat / rad)
+            t_pos = np.maximum(target, 0.0)
+            ref = np.where(t_pos > eps, t_pos * np.log(np.maximum(t_pos, eps)) - t_pos, 0.0)
+            loss_vec = (g_tilde - t_pos * np.log(g_tilde)) + ref
+            loss = float(np.sum(w_asu * loss_vec) * inv_w)
+            dL = w_asu * inv_w * (1.0 - t_pos / g_tilde) * dg_tilde
+        else:
+            diff = g_hat - target
+            loss = float(0.5 * np.sum(w_asu * (diff ** 2)) * inv_w)
+            dL = w_asu * inv_w * diff
+
+        if lam_f > 0.0:
+            dm = float(np.dot(w_cell, g_hat)) - g_mean_targ
+            loss += 0.5 * lam_f * (dm * dm)
+            dL = dL + (lam_f * dm) * w_cell
+        return loss, dL
+
+    return _loss_and_grad
+
+
 def fit_surfnturf_model(datasets_spec, loss_mode: str = "l2", n_types: int = 10,
                         use_lp: bool = True, use_tet_oz: bool = True, n_oz_steps: int = None,
                         use_epol: bool = False, use_pauli_cap: bool = True, zero_bulk_offset: bool = True,
                         use_langmuir: bool = True, use_oz: bool = True, use_hpol: bool = True,
-                        use_blur: bool = True, fit_box_scale: bool = True, step: int = 2,
-                        nconf: int = 32, lam_pmf: float = 2e-3, lam_hpol: float = 2e-3,
-                        lam_oz: float = 1e-4, lam_extra: float = 2e-4, maxiter: int = 220, out_npz: str = None):
+                        use_blur: bool = True, fit_box_scale: bool = False, lam_f000: float = 0.25,
+                        target_mean_eA3: float = None, step: int = 2, nconf: int = 32,
+                        lam_pmf: float = 2e-3, lam_hpol: float = 2e-3, lam_oz: float = 1e-4,
+                        lam_extra: float = 2e-4, maxiter: int = 220, init_theta=None, out_npz: str = None):
     """Fit a surfNturf `WaterFieldSpec` jointly across one or more `(name, map_path, model_path, B_map)` datasets.
 
-    By default (`use_lp=True, use_tet_oz=True, n_oz_steps=4, use_pauli_cap=True, zero_bulk_offset=True, use_epol=False`),
-    trains explicit sp2/sp3 lone pairs + 4-step tetrahedral (109.47 deg) H-bond network closure + Rosenfeld 0D 1-water
-    cavity cap + exact zero-offset bulk asymptote, keeping crystal E-field polarization (`use_epol`) off by default.
+    By default (`fit_box_scale=False, zero_bulk_offset=True, lam_f000=0.25`), trains at strict unit chemical scale
+    (`k_solv == 1.000` in e/A^3, never fitting & discarding a box multiplier that inflates hydration shells!) and
+    enforces unit-cell `F000_solv` / Gibbs-excess conservation alongside empty-bulk asymptote `g_O(inf) == 1.000`.
     """
     t0 = time.time()
     two_type = (int(n_types) == 2)
@@ -121,8 +156,18 @@ def fit_surfnturf_model(datasets_spec, loss_mode: str = "l2", n_types: int = 10,
         use_pauli_cap=bool(use_pauli_cap), zero_bulk_offset=bool(zero_bulk_offset),
     )
     theta0 = spec.init_params()
+    if init_theta is not None:
+        it = np.asarray(init_theta, dtype=np.float64)
+        n_cp = min(len(theta0), len(it))
+        theta0[:n_cp] = it[:n_cp]
     bounds = param_bounds(spec)
+    theta0 = np.clip(theta0, [b[0] for b in bounds], [b[1] for b in bounds])
     inv_nd = 1.0 / max(len(bundles), 1)
+    ext_losses = [
+        _make_voxel_plus_f000_loss(ds, loss_mode, lam_f000, target_mean_eA3=target_mean_eA3)
+        if (float(lam_f000) > 0.0 or target_mean_eA3 is not None) else None
+        for ds in bundles
+    ]
 
     def obj_and_grad(th):
         tot_loss, tot_grad = smoothness_penalty_and_grad(
@@ -130,7 +175,8 @@ def fit_surfnturf_model(datasets_spec, loss_mode: str = "l2", n_types: int = 10,
         )
         for idx, ds in enumerate(bundles):
             l_i, g_i, _, _ = forward_and_grad(
-                spec, ds, th, ds_index=idx, loss_mode=loss_mode, compute_grad=True
+                spec, ds, th, ds_index=idx, loss_mode=loss_mode, compute_grad=True,
+                ext_dL_dghat=ext_losses[idx],
             )
             tot_loss += inv_nd * l_i
             tot_grad += inv_nd * g_i
@@ -148,9 +194,30 @@ def fit_surfnturf_model(datasets_spec, loss_mode: str = "l2", n_types: int = 10,
         use_epol=use_epol_eff, use_pauli_cap=bool(use_pauli_cap), zero_bulk_offset=bool(zero_bulk_offset),
     )
     theta_export = res.x[:spec_export.n_params].copy()
+
+    # Measure unit-cell F000 / mean density balance across training datasets at exported k == 1.000
+    f000_diag = {}
+    for ds in bundles:
+        gh_exp, _ = forward_and_grad(spec_export, ds, theta_export, ds_index=0, compute_grad=False)
+        w_cell = ds.grid.orbit_mult.astype(np.float64) / float(ds.grid.nvox)
+        pred_mean = float(np.dot(w_cell, gh_exp) * RHO_BULK)
+        targ_mean = float(np.dot(w_cell, ds.g_asu) * RHO_BULK)
+        f000_diag[ds.name] = {
+            "pred_mean_eA3": round(pred_mean, 5),
+            "targ_mean_eA3": round(targ_mean, 5),
+            "ratio": round(pred_mean / max(targ_mean, 1e-8), 4),
+        }
+
     written_npz = None
     if out_npz is not None:
-        written_npz = save_spec_and_theta(out_npz, spec_export, theta_export, extra_meta={"loss_mode": loss_mode})
+        written_npz = save_spec_and_theta(
+            out_npz, spec_export, theta_export,
+            extra_meta={
+                "loss_mode": loss_mode,
+                "fit_box_scale": int(bool(fit_box_scale)),
+                "lam_f000": float(lam_f000),
+            },
+        )
 
     return {
         "spec": spec_export,
@@ -160,5 +227,6 @@ def fit_surfnturf_model(datasets_spec, loss_mode: str = "l2", n_types: int = 10,
         "nit": int(res.nit),
         "success": bool(res.success),
         "dt_s": round(time.time() - t0, 2),
+        "f000_diag": f000_diag,
         "out_npz": written_npz,
     }

@@ -296,7 +296,7 @@ def _cmd_fit_bmob(args):
 
     km_mode = args.kmask_mode
     if km_mode == "auto":
-        km_mode = "per_bin" if args.mode == "joint" else "fixed_one"
+        km_mode = "fixed_one"
 
     fwhm_arg = "auto" if str(args.fwhm).strip().lower() == "auto" else float(args.fwhm)
     lam_arg = "auto" if str(args.lam_z).strip().lower() == "auto" else float(args.lam_z)
@@ -475,6 +475,7 @@ def _cmd_fit_divot(args):
         extract_problem_from_fmodel,
         fit_periodic_arm,
         fit_adaptive_divot_peak_blind,
+        fit_haze_arm_blind,
         write_fpart_cgrid,
     )
 
@@ -537,6 +538,14 @@ def _cmd_fit_divot(args):
             use_scale=True, use_warp=True, mass_conserving=False
         )
         rho_opt, _, info = fit_periodic_arm(prob, pf)
+    elif arm == "haze":
+        rho_opt, info = fit_haze_arm_blind(
+            prob, cgrid, base_3d, open_mask, use_peaks=False, gate_on_val=gate_val,
+        )
+    elif arm == "haze_peak":
+        rho_opt, info = fit_haze_arm_blind(
+            prob, cgrid, base_3d, open_mask, use_peaks=True, gate_on_val=gate_val,
+        )
     elif arm == "peak":
         rho_opt, info = fit_adaptive_divot_peak_blind(
             prob, cgrid, base_3d, open_mask, fitreso_s=12.0,
@@ -849,15 +858,83 @@ def _cmd_train(args):
         use_epol=bool(args.epol),
         use_pauli_cap=not args.no_pauli_cap,
         zero_bulk_offset=not args.no_zero_bulk,
+        fit_box_scale=bool(args.fit_box_scale),
+        lam_f000=float(args.lam_f000),
         step=args.step,
         nconf=args.nconf,
         maxiter=args.maxiter,
         out_npz=args.out,
     )
     written = res.get("out_npz") or args.out
+    f0_str = ", ".join(
+        f"{k}:{v['pred_mean_eA3']:.4f}/{v['targ_mean_eA3']:.4f}({v['ratio']:.3f}x)"
+        for k, v in res.get("f000_diag", {}).items()
+    )
     print(
         f"Trained surfNturf ({args.loss}, {len(datasets)} datasets, {res['spec'].n_params} params, "
-        f"{res['nit']} L-BFGS-B iters in {res['dt_s']}s): loss={res['loss']:.6f} -> wrote {written}"
+        f"{res['nit']} L-BFGS-B iters in {res['dt_s']}s): loss={res['loss']:.6f} "
+        f"[F000 pred/targ: {f0_str}] -> wrote {written}"
+    )
+
+
+def _cmd_score_k1(args):
+    from .bmob import load_reciprocal_target_from_fmodel_mtz
+    from .field import solv_to_fpart
+
+    target, cell, sg = load_reciprocal_target_from_fmodel_mtz(
+        args.fmodel_mtz, data_mtz_path=args.data_mtz, free_flag_value=args.free_flag_value,
+    )
+    if args.solvent_ccp4:
+        solv_3d, m_cell, m_sg, has_sg = read_ccp4_map_checked(args.solvent_ccp4)
+        check_crystal_compatibility(m_cell, (m_sg if has_sg else sg), str(args.solvent_ccp4), cell, sg, str(args.fmodel_mtz))
+        f_part = solv_to_fpart(solv_3d, cell.volume, target.hkl)
+        src_desc = str(args.solvent_ccp4)
+    else:
+        src_mtz_p = args.fpart_mtz or args.fmodel_mtz
+        mtz = gemmi.read_mtz_file(src_mtz_p)
+        check_crystal_compatibility(mtz.cell, mtz.spacegroup, str(src_mtz_p), cell, sg, str(args.fmodel_mtz))
+        arr = np.array(mtz, copy=False)
+        cmap = {l.upper().replace("-", "").replace("_", ""): arr[:, i] for i, l in enumerate(mtz.column_labels())}
+        fa = cmap.get("FPART") if "FPART" in cmap else cmap.get("FMASK")
+        fp = (cmap.get("PHIPART") if "PHIPART" in cmap else
+              (cmap.get("PHIFPART") if "PHIFPART" in cmap else cmap.get("PHIFMASK")))
+        if fa is None or fp is None:
+            raise SystemExit(f"{src_mtz_p} lacks FPART/PHIPART or FMASK/PHIFMASK columns.")
+        H_src = arr[:, :3].astype(np.int64)
+        F_src = fa.astype(np.float64) * np.exp(1j * np.deg2rad(fp.astype(np.float64)))
+        lut = {}
+        for op in sg.operations():
+            R_op = np.array(op.rot, dtype=np.int64) // op.DEN
+            t_op = np.array(op.tran, dtype=np.float64) / op.DEN
+            H_rot = H_src @ R_op
+            F_rot = F_src * np.exp(-2j * np.pi * (H_src @ t_op))
+            for h_r, f_r in zip(H_rot, F_rot):
+                kp = (int(h_r[0]), int(h_r[1]), int(h_r[2]))
+                if kp not in lut and np.isfinite(f_r):
+                    lut[kp] = complex(f_r)
+                kn = (-kp[0], -kp[1], -kp[2])
+                if kn not in lut and np.isfinite(f_r):
+                    lut[kn] = complex(np.conj(f_r))
+        f_part = np.array([lut.get((int(h[0]), int(h[1]), int(h[2])), 0.0 + 0.0j) for h in target.hkl], dtype=np.complex128)
+        src_desc = str(src_mtz_p)
+
+    res = target.eval_unscaled_k1(f_part, n_iso_bins=args.iso_bins)
+    res["source"] = src_desc
+    if args.out_json:
+        od = os.path.dirname(os.path.abspath(args.out_json))
+        if od:
+            os.makedirs(od, exist_ok=True)
+        with open(args.out_json, "w", encoding="utf-8", newline="\n") as jf:
+            json.dump(res, jf, indent=2)
+
+    rf_ki = res["r_free_k1_kiso"]
+    rf_1k = res["r_free_k1_1scalar"]
+    s_gt10 = res["shells"].get(">10.0A", {})
+    gt10_str = f", >10A R_w={100.0 * s_gt10['r_work_kiso']:.2f}%" if s_gt10.get("r_work_kiso") is not None else ""
+    print(
+        f"score-k1 (k_mask===1.000): k_iso*k_aniso R_work/R_free = {100.0 * res['r_work_k1_kiso']:.2f}% / "
+        f"{100.0 * rf_ki:.2f}% (bin1 k_iso={res['k_iso_bin1']:.3f}{gt10_str}) | "
+        f"1-scalar k0={res['k0_1scalar']:.3f} R_work/R_free = {100.0 * res['r_work_k1_1scalar']:.2f}% / {100.0 * rf_1k:.2f}%"
     )
 
 
@@ -925,7 +1002,7 @@ def build_parser() -> argparse.ArgumentParser:
     sb.add_argument("--mode", default="auto", choices=["auto", "uniform", "phys", "tb32", "joint"],
                     help="Mobility fit mode ('auto' gates 0shot/uniform/phys/spatial on unseen 5%% work_val; default: auto).")
     sb.add_argument("--kmask-mode", default="auto", choices=["auto", "fixed_one", "global_scalar", "per_bin"],
-                    help="Reciprocal k_mask ruler ('auto' uses 'fixed_one' for auto/uniform/phys/tb32 and 'per_bin' for joint; 'global_scalar' fits 1 mother-liquor density scalar k_bulk in [0.65, 1.50]).")
+                    help="Reciprocal k_mask ruler ('auto' uses 'fixed_one' across all modes incl. joint; 'global_scalar' fits 1 mother-liquor density scalar k_bulk in [0.65, 1.50]).")
     sb.add_argument("--fwhm", default="auto",
                     help="Spatial coupling FWHM in A or 'auto' -> 3.2 A for d_min <= 1.0 A, else max(3.2, 3.5*d_min) (default: auto).")
     sb.add_argument("--lam-z", default="auto",
@@ -953,7 +1030,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="R-free flag value marking the test set (default: minority value of 0/1 flags, else 0).")
     sd.add_argument("--base-ccp4", default=None, help="Optional starting solvent CCP4 map (defaults to surfNturf prediction).")
     sd.add_argument("--weights", default="l2", help="surfNturf weights if generating starting base ('l2', 'kl', or .npz).")
-    sd.add_argument("--arm", default="hybrid", choices=["hybrid", "peak", "divot", "sw6_mc", "sw6_std"], help="Refinement arm.")
+    sd.add_argument("--arm", default="hybrid",
+                    choices=["hybrid", "peak", "divot", "haze", "haze_peak", "sw6_mc", "sw6_std"],
+                    help="Refinement arm ('haze'/'haze_peak' strictly conserve base F000 and 0.0000 vacuum core).")
     sd.add_argument("--grid", type=float, default=0.45, help="Grid spacing in A when generating starting base (default: 0.45).")
     sd.add_argument("--nconf", type=int, default=32, help="Conformer count when generating starting base (default: 32).")
     sd.add_argument("--ignore-waters", action="store_true", help="Do not displace ordered HOH when generating starting base.")
@@ -1026,10 +1105,25 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Enable screened AMBER-charge crystal E-field polarization (+Epol, off by default).")
     st.add_argument("--no-pauli-cap", action="store_true", help="Disable Rosenfeld 0D 1-water exclusion cavity cap.")
     st.add_argument("--no-zero-bulk", action="store_true", help="Disable exact empty-bulk asymptote subtraction.")
+    st.add_argument("--fit-box-scale", action="store_true", default=False,
+                    help="Fit per-dataset disposable box scale (off by default to preserve exact k=1 F000 stoichiometry).")
+    st.add_argument("--lam-f000", type=float, default=0.25,
+                    help="Unit-cell F000 / mean solvent density conservation weight (default: 0.25).")
     st.add_argument("--step", type=int, default=2, help="Grid subsampling stride during training (default: 2).")
     st.add_argument("--nconf", type=int, default=32, help="Conformer count for multi-altloc PDBs (default: 32).")
     st.add_argument("--maxiter", type=int, default=220, help="Max L-BFGS-B iterations (default: 220).")
     st.set_defaults(func=_cmd_train)
+
+    # 8. score-k1
+    sk1 = sub.add_parser("score-k1", help="Unconfounded strict k_mask=1.000 ruler (with work-fitted per-bin k_iso*k_aniso + 1-scalar k0).")
+    sk1.add_argument("--fmodel-mtz", required=True, help="Phenix *_f_model.mtz supplying FOBS, R_FREE_FLAGS, FCALC, PHIFCALC, K_ANISOTROPIC.")
+    sk1.add_argument("--fpart-mtz", default=None, help="Optional FPART/PHIPART MTZ (defaults to FMASK/PHIFMASK in --fmodel-mtz).")
+    sk1.add_argument("--solvent-ccp4", default=None, help="Optional solvent CCP4 map in e/A^3 to score directly at k_mask=1.000.")
+    sk1.add_argument("--data-mtz", default=None, help="Optional diffraction MTZ for FreeR_flag check.")
+    sk1.add_argument("--free-flag-value", type=int, default=None, help="R-free flag value marking the test set.")
+    sk1.add_argument("--iso-bins", type=int, default=11, help="Number of logarithmic-resolution k_iso shells (default: 11).")
+    sk1.add_argument("--out-json", default=None, help="Optional JSON output path.")
+    sk1.set_defaults(func=_cmd_score_k1)
 
     # 6. test
     stest = sub.add_parser("test", help="Run surfNturf's analytical & finite-difference verification suite.")

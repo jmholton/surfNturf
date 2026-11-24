@@ -550,7 +550,8 @@ class PeriodicFourierFields:
 
 
 def pick_asu_difference_peaks(cgrid: CrystalGridOps, diff_maps_and_sigmas, open_mask_3d,
-                              z_thresh=3.5, max_peaks=120, min_sep_A=1.45, open_min=0.18):
+                              z_thresh=3.5, max_peaks=120, min_sep_A=1.45, open_min=0.18,
+                              positive_only: bool = False):
     """Pick symmetry-unique local 3D extrema across multi-scale open-solvent work-train mFo - DFc maps."""
     candidates = []
 
@@ -561,7 +562,7 @@ def pick_asu_difference_peaks(cgrid: CrystalGridOps, diff_maps_and_sigmas, open_
             open_vals = dmap.ravel()
         sigma = max(1.4826 * float(np.median(np.abs(open_vals - np.median(open_vals)))), 1e-6)
         zmap = wmap / sigma
-        az = np.abs(zmap)
+        az = np.maximum(zmap, 0.0) if positive_only else np.abs(zmap)
 
         is_max = (az >= float(z_thresh)) & (open_mask_3d >= open_min)
         for dx in (-1, 0, 1):
@@ -612,13 +613,15 @@ def pick_asu_difference_peaks(cgrid: CrystalGridOps, diff_maps_and_sigmas, open_
 class ContinuousPeakDict:
     """Continuous-coordinate space-group-symmetric IT92 Gaussian water/ion dictionary (zero grid-edge ripple)."""
 
-    def __init__(self, cgrid: CrystalGridOps, peak_seeds, B_base=2.0, half_win=9, max_shift=0.75, b_min=None):
+    def __init__(self, cgrid: CrystalGridOps, peak_seeds, B_base=2.0, half_win=9, max_shift=0.75, b_min=None,
+                 nonneg_dq: bool = False):
         self.cgrid = cgrid
         self.M = len(peak_seeds)
         self.B_base = float(B_base)
         self.b_min = float(b_min) if b_min is not None else 5.5
         self.half_win = int(half_win)
         self.max_shift = float(max_shift)
+        self.nonneg_dq = bool(nonneg_dq)
         self.xyz0 = np.array([p['xyz0'] for p in peak_seeds], dtype=np.float64) if self.M else np.zeros((0, 3))
         self.B_init = np.array([p['B_init'] for p in peak_seeds], dtype=np.float64) if self.M else np.zeros(0)
         self.z_init = np.array([p['z_score'] for p in peak_seeds], dtype=np.float64) if self.M else np.zeros(0)
@@ -644,8 +647,9 @@ class ContinuousPeakDict:
         b = []
         ms = self.max_shift
         lo_eta, hi_eta = self._eta_bounds()
+        dq_lo = 0.0 if self.nonneg_dq else -1.8
         for _ in range(self.M):
-            b.extend([(-1.8, 2.8), (-ms, ms), (-ms, ms), (-ms, ms), (lo_eta, hi_eta)])
+            b.extend([(dq_lo, 2.8), (-ms, ms), (-ms, ms), (-ms, ms), (lo_eta, hi_eta)])
         return b
 
     def unpack(self, theta_p):
@@ -1567,3 +1571,328 @@ def fit_adaptive_divot_peak_blind(prob: SolventAmplitudeProblem, cgrid: CrystalG
     info_final['dt_s'] = round(time.time() - t0, 1)
     info_final['val_trace'] = val_trace
     return rho_final, info_final
+
+
+def _real_symmetric_gaussian_rfft(cgrid: CrystalGridOps, B_iso: float) -> np.ndarray:
+    """Construct exact non-negative, inversion-symmetric periodic Gaussian kernel `G_hat` (`G_hat[0,0,0] == 1.0`)."""
+    shape = cgrid.shape
+    raw_hat = np.exp(-float(B_iso) * cgrid.stol2_r)
+    k_real = np.maximum(sp_fft.irfftn(raw_hat, s=shape, workers=cgrid.workers), 0.0)
+    idx0 = (-np.arange(shape[0])) % shape[0]
+    idx1 = (-np.arange(shape[1])) % shape[1]
+    idx2 = (-np.arange(shape[2])) % shape[2]
+    k_sym = 0.5 * (k_real + k_real[np.ix_(idx0, idx1, idx2)])
+    s_tot = float(np.sum(k_sym))
+    if s_tot > 0.0:
+        k_sym /= s_tot
+    else:
+        k_sym.fill(0.0)
+        k_sym[0, 0, 0] = 1.0
+    return np.real(sp_fft.rfftn(k_sym, s=shape, workers=cgrid.workers))
+
+
+class VacuumConservingHazeField:
+    """Strictly `F000`-conserving (`< 1e-14`) & zero-vacuum-core (`0.0000 e/A^3`) local diffuse-fraction field `haze(x)`.
+
+    Implements the source-normalized two-width solvent redistribution (`VACUUM_OFFSET_ANALYSIS.md` §2.3 `regblur`/`locedit`):
+        rho_haze(x) = (1 - h(x)) * rho0(x) + M(x) * (G_B * [ (h * rho0) / (G_B * M) ])(x)
+    Because `<M, G_B * u> = <G_B * M, u>` for symmetric `G_B`, total unit-cell solvent electrons are conserved
+    identically (`sum(rho_haze) === sum(rho0)`) for every field `h(x) in [0, h_max]`, while `rho_haze(x) === 0`
+    everywhere inside the macromolecular core (`M(x) == 0`) and `rho_haze(x) >= 0` everywhere without `softplus_pos`.
+    """
+
+    def __init__(self, cgrid: CrystalGridOps, base_3d, open_mask_3d, B_haze: float = 75.0,
+                 fwhm_A='auto', h_max: float = 0.88, d_min: float = 1.0):
+        self.cgrid = cgrid
+        self.B_haze = float(B_haze)
+        self.h_max = float(np.clip(h_max, 0.05, 0.98))
+        self.d_min = float(d_min)
+
+        supp = build_solvent_support_mask(base_3d, open_mask_3d)
+        rho_in = np.maximum(np.asarray(base_3d, dtype=np.float64), 0.0)
+        self.M_supp = supp
+        self.rho0 = np.where(supp > 0.0, rho_in, 0.0)
+        self.f000_init = float(np.sum(self.rho0) * cgrid.vox_vol)
+
+        self.G_haze_hat = _real_symmetric_gaussian_rfft(cgrid, self.B_haze)
+        gm = sp_fft.irfftn(
+            self.G_haze_hat * sp_fft.rfftn(self.M_supp, s=cgrid.shape, workers=cgrid.workers),
+            s=cgrid.shape, workers=cgrid.workers,
+        )
+        self.inv_GM = np.where(gm > 1e-12, 1.0 / np.maximum(gm, 1e-12), 0.0)
+
+        if str(fwhm_A).strip().lower() == 'auto':
+            self.fwhm_A = max(2.6, round(2.5 * self.d_min, 2))
+        else:
+            self.fwhm_A = max(1.5, float(fwhm_A))
+        sig_f = self.fwhm_A / 2.354820045
+        b_fwhm = 8.0 * (math.pi ** 2) * (sig_f ** 2)
+        self.G_fwhm_hat = _real_symmetric_gaussian_rfft(cgrid, b_fwhm)
+
+        self.asu_reps = np.asarray(cgrid.asu_reps, dtype=np.int64)
+        self.n_asu = int(len(self.asu_reps))
+
+    def forward_and_pullback(self, params, local: bool = True, compute_grad: bool = True):
+        """Evaluate `rho_haze` (`1` param `[zeta0]` if `local=False`, else `1 + n_asu` `[zeta0, eta_asu...]`)."""
+        cgrid = self.cgrid
+        shape = cgrid.shape
+        w = cgrid.workers
+        p = np.asarray(params, dtype=np.float64)
+        zeta0 = float(p[0])
+
+        if local and len(p) > 1:
+            eta = p[1:]
+            u3 = np.zeros(shape, dtype=np.float64)
+            u3.ravel()[self.asu_reps] = eta
+            u_sym = cgrid.sym_s(u3)
+            dz_3d = sp_fft.irfftn(
+                self.G_fwhm_hat * sp_fft.rfftn(u_sym, s=shape, workers=w),
+                s=shape, workers=w,
+            )
+            z_3d = zeta0 + dz_3d
+        else:
+            z_3d = np.full(shape, zeta0, dtype=np.float64)
+
+        sig_z = 1.0 / (1.0 + np.exp(-np.clip(z_3d, -40.0, 40.0)))
+        h_3d = self.h_max * sig_z
+
+        w_src = (h_3d * self.rho0) * self.inv_GM
+        spread = self.M_supp * sp_fft.irfftn(
+            self.G_haze_hat * sp_fft.rfftn(w_src, s=shape, workers=w),
+            s=shape, workers=w,
+        )
+        rho = (1.0 - h_3d) * self.rho0 + spread
+
+        solv_m = self.M_supp > 0.10
+        diag = {
+            "h_mean": float(np.mean(h_3d[solv_m])) if np.any(solv_m) else float(np.mean(h_3d)),
+            "h_p90": float(np.percentile(h_3d[solv_m], 90.0)) if np.any(solv_m) else float(np.max(h_3d)),
+            "f000_e": float(np.sum(rho) * cgrid.vox_vol),
+        }
+        if not compute_grad:
+            return rho, diag, None
+
+        dsig = self.h_max * sig_z * (1.0 - sig_z)
+
+        def pullback(grho):
+            gr = np.asarray(grho, dtype=np.float64)
+            adj_sp = self.inv_GM * sp_fft.irfftn(
+                self.G_haze_hat * sp_fft.rfftn(self.M_supp * gr, s=shape, workers=w),
+                s=shape, workers=w,
+            )
+            gh_3d = self.rho0 * (adj_sp - gr)
+            gz_3d = gh_3d * dsig
+            gz0 = float(np.sum(gz_3d))
+            if not (local and len(p) > 1):
+                return np.array([gz0], dtype=np.float64)
+            gu_sym = sp_fft.irfftn(
+                self.G_fwhm_hat * sp_fft.rfftn(gz_3d, s=shape, workers=w),
+                s=shape, workers=w,
+            )
+            gu3 = cgrid.sym_s_adj(gu_sym)
+            geta = gu3.ravel()[self.asu_reps]
+            return np.concatenate([np.array([gz0], dtype=np.float64), geta])
+
+        return rho, diag, pullback
+
+
+def fit_haze_arm_blind(prob: SolventAmplitudeProblem, cgrid: CrystalGridOps, base_3d, open_mask_3d,
+                       use_peaks: bool = False, B_haze: float = 75.0, fwhm_A='auto',
+                       lam_eta='auto', gate_on_val: bool = True, min_rval_gain='auto',
+                       maxiter: int = 55):
+    """Fit vacuum-respecting `F000`-conserving `haze(x)` (and optional positive-only `PeakDict`) with `5%` blind gating.
+
+    Stages fitted strictly on `prob.train` (`90%`) and gated on unseen `prob.val` (`5%`, `FreeR` untouched):
+      0. `base`: untouched `base_3d`
+      1. `haze_uniform`: 1-parameter global partial smear (`regblur`)
+      2. `haze_local`: spatially varying `haze(x)` (`locedit`, `1.0000x` electron conservation, `0.0000` core)
+      3. `haze_peak` (if `use_peaks=True`): `haze(x)` + positive-only (`dq >= 0`) `ContinuousPeakDict` (`peakseq`)
+    """
+    t0 = time.time()
+    d_min_p = float(np.min(prob.d_arr)) if len(prob.d_arr) else 1.0
+    haze = VacuumConservingHazeField(
+        cgrid, base_3d, open_mask_3d, B_haze=B_haze, fwhm_A=fwhm_A, d_min=d_min_p
+    )
+    if str(lam_eta).strip().lower() == 'auto':
+        lam_eff = 2.5e-4 * max(1.0, (d_min_p / 0.965) ** 3)
+    else:
+        lam_eff = float(lam_eta)
+    w_eta = float(lam_eff) / max(float(haze.n_asu), 1.0)
+
+    ev_base = prob.eval_rho(haze.rho0, active_mask=prob.train, compute_grad=False)
+    rval_base = ev_base['r_val'] if math.isfinite(ev_base['r_val']) else ev_base['r_train']
+    if min_rval_gain is None or str(min_rval_gain).strip().lower() == 'auto':
+        n_val = max(int(np.sum(prob.val)), 1)
+        min_gain = max(8e-4, 0.70 * float(rval_base) / math.sqrt(2.0 * n_val))
+    else:
+        min_gain = float(min_rval_gain)
+
+    # Stage 1: 1-scalar uniform partial smear (`haze_uniform`)
+    def _make_u_obj(mask):
+        def _obj_u(x):
+            rho, _, pb = haze.forward_and_pullback(x, local=False, compute_grad=True)
+            ev = prob.eval_rho(rho, active_mask=mask, compute_grad=True)
+            return ev['loss'], pb(ev['grho'])
+        return _obj_u
+
+    best_z0 = -1.6
+    best_lu = float('inf')
+    for z_try in (-3.5, -2.0, -1.1, -0.4):
+        lt, _ = _make_u_obj(prob.train)(np.array([z_try]))
+        if lt < best_lu:
+            best_lu = lt
+            best_z0 = z_try
+    res_u_tr = minimize(_make_u_obj(prob.train), np.array([best_z0]), method='L-BFGS-B', jac=True,
+                        bounds=[(-6.0, 2.5)], options={'maxiter': 25, 'ftol': 1e-11})
+    rho_u_tr, diag_u_tr, _ = haze.forward_and_pullback(res_u_tr.x, local=False, compute_grad=False)
+    ev_u = prob.eval_rho(rho_u_tr, active_mask=prob.train, compute_grad=False)
+    rval_u = ev_u['r_val'] if math.isfinite(ev_u['r_val']) else ev_u['r_train']
+
+    # Stage 2: local `haze(x)` field (`haze_local`)
+    def _make_loc_obj(mask):
+        def _obj_l(x):
+            rho, _, pb = haze.forward_and_pullback(x, local=True, compute_grad=True)
+            ev = prob.eval_rho(rho, active_mask=mask, compute_grad=True)
+            eta = x[1:]
+            pen = 0.5 * w_eta * float(eta @ eta)
+            g = pb(ev['grho'])
+            g[1:] += w_eta * eta
+            return ev['loss'] + pen, g
+        return _obj_l
+
+    x_loc0 = np.zeros(1 + haze.n_asu, dtype=np.float64)
+    x_loc0[0] = float(res_u_tr.x[0])
+    b_loc = [(-6.0, 2.5)] + [(-4.0, 4.0)] * haze.n_asu
+    res_l_tr = minimize(_make_loc_obj(prob.train), x_loc0, method='L-BFGS-B', jac=True, bounds=b_loc,
+                        options={'maxiter': int(maxiter), 'ftol': 1e-11, 'gtol': 1e-8})
+    rho_l_tr, diag_l_tr, _ = haze.forward_and_pullback(res_l_tr.x, local=True, compute_grad=False)
+    ev_l = prob.eval_rho(rho_l_tr, active_mask=prob.train, compute_grad=False)
+    rval_l = ev_l['r_val'] if math.isfinite(ev_l['r_val']) else ev_l['r_train']
+
+    # Stage 3 (optional): `haze(x)` + positive-only `ContinuousPeakDict` (`peakseq`)
+    rval_hp = float('inf')
+    best_pk_pack = None
+    b_lo = max(6.0, round(3.0 * (d_min_p ** 2), 1)) if d_min_p > 1.45 else 6.0
+    b_hi = max(22.0, round(8.0 * (d_min_p ** 2), 1)) if d_min_p > 1.45 else 22.0
+    b_peak_min = max(5.5, 4.0 * (d_min_p ** 2))
+    min_sep_eff = max(1.35, round(0.85 * d_min_p, 2)) if d_min_p > 1.60 else 1.35
+    n_tr_act = max(int(np.sum(prob.train)), 1)
+    max_peaks_eff = min(90, max(6, n_tr_act // 220))
+
+    if use_peaks:
+        seed_haze_x = res_l_tr.x if (rval_l < rval_u) else np.concatenate([res_u_tr.x, np.zeros(haze.n_asu)])
+        seed_haze_rho = rho_l_tr if (rval_l < rval_u) else rho_u_tr
+        dm8 = prob.compute_work_diff_map(seed_haze_rho, active_mask=prob.train, B_smooth=b_lo)
+        dm22 = prob.compute_work_diff_map(seed_haze_rho, active_mask=prob.train, B_smooth=b_hi)
+        hp_cands = ((4.2, 6.0e-5), (3.5, 2.5e-5)) if d_min_p < 1.80 else ((4.5, 1.5e-4), (3.8, 6.0e-5))
+        n_hx = 1 + haze.n_asu
+
+        for z_t, l1_w in hp_cands:
+            seeds = pick_asu_difference_peaks(
+                cgrid, [(b_lo, dm8), (b_hi, dm22)], open_mask_3d,
+                z_thresh=z_t, max_peaks=max_peaks_eff, min_sep_A=min_sep_eff, positive_only=True,
+            )
+            for ns in seeds:
+                ns['B_init'] = max(float(ns['B_init']), b_peak_min + 2.0)
+            pdict = ContinuousPeakDict(cgrid, seeds, b_min=b_peak_min, nonneg_dq=True)
+            if pdict.M == 0:
+                continue
+
+            def _make_hp_obj(mask, pd_cur, l1_cur):
+                def _obj_hp(vec):
+                    xh = vec[:n_hx]
+                    xp = vec[n_hx:]
+                    rh, _, pb_h = haze.forward_and_pullback(xh, local=True, compute_grad=True)
+                    rp, pb_p = pd_cur.forward_and_pullback(xp, compute_grad=True)
+                    tot = rh + haze.M_supp * np.maximum(rp, 0.0)
+                    ev = prob.eval_rho(tot, active_mask=mask, compute_grad=True)
+                    gr = ev['grho']
+                    eta = xh[1:]
+                    gh = pb_h(gr)
+                    gh[1:] += w_eta * eta
+                    pen = 0.5 * w_eta * float(eta @ eta)
+
+                    dq_v, dxyz_v, _ = pd_cur.unpack(xp)
+                    l1_p, gl1_dq = smooth_l1_penalty(dq_v, eps=0.015)
+                    pen_xyz = 2e-6 * float(np.sum(dxyz_v ** 2))
+                    pen += float(l1_cur) * l1_p + pen_xyz
+                    gp_grid = gr * haze.M_supp * (rp >= 0.0)
+                    gpk = pb_p(gp_grid).reshape(-1, 5)
+                    gpk[:, 0] += float(l1_cur) * gl1_dq
+                    gpk[:, 1:4] += 4e-6 * dxyz_v
+                    return ev['loss'] + pen, np.concatenate([gh, gpk.ravel()])
+                return _obj_hp
+
+            x_hp0 = np.concatenate([seed_haze_x, pdict.init_params()])
+            b_hp = b_loc + pdict.bounds()
+            res_hp = minimize(_make_hp_obj(prob.train, pdict, l1_w), x_hp0, method='L-BFGS-B', jac=True,
+                              bounds=b_hp, options={'maxiter': int(maxiter), 'ftol': 1e-11, 'gtol': 1e-8})
+            rh_t, _, _ = haze.forward_and_pullback(res_hp.x[:n_hx], local=True, compute_grad=False)
+            rp_t, _ = pdict.forward_and_pullback(res_hp.x[n_hx:], compute_grad=False)
+            tot_t = rh_t + haze.M_supp * np.maximum(rp_t, 0.0)
+            ev_hp = prob.eval_rho(tot_t, active_mask=prob.train, compute_grad=False)
+            sc_hp = ev_hp['r_val'] if math.isfinite(ev_hp['r_val']) else ev_hp['r_train']
+            if sc_hp < rval_hp:
+                rval_hp = float(sc_hp)
+                best_pk_pack = (z_t, l1_w, seeds, pdict, res_hp.x.copy(), _make_hp_obj)
+
+    if gate_on_val and np.any(prob.val):
+        best_stage = 'base'
+        best_rv = float(rval_base)
+        if rval_u < best_rv - 0.5 * min_gain:
+            best_stage = 'haze_uniform'
+            best_rv = float(rval_u)
+        if rval_l < best_rv - min_gain:
+            best_stage = 'haze_local'
+            best_rv = float(rval_l)
+        if use_peaks and best_pk_pack is not None and rval_hp < best_rv - min_gain:
+            best_stage = 'haze_peak'
+            best_rv = float(rval_hp)
+    else:
+        if use_peaks and best_pk_pack is not None:
+            best_stage, best_rv = 'haze_peak', float(rval_hp)
+        else:
+            best_stage, best_rv = 'haze_local', float(rval_l)
+
+    n_peaks_act = 0
+    if best_stage == 'base':
+        rho_final = haze.rho0.copy()
+        h_diag = {"h_mean": 0.0, "h_p90": 0.0, "f000_e": haze.f000_init}
+    elif best_stage == 'haze_uniform':
+        res_uw = minimize(_make_u_obj(prob.work), res_u_tr.x, method='L-BFGS-B', jac=True,
+                          bounds=[(-6.0, 2.5)], options={'maxiter': 15, 'ftol': 1e-11})
+        rho_final, h_diag, _ = haze.forward_and_pullback(res_uw.x, local=False, compute_grad=False)
+    elif best_stage == 'haze_local':
+        res_lw = minimize(_make_loc_obj(prob.work), res_l_tr.x, method='L-BFGS-B', jac=True,
+                          bounds=b_loc, options={'maxiter': 25, 'ftol': 1e-11, 'gtol': 1e-8})
+        rho_final, h_diag, _ = haze.forward_and_pullback(res_lw.x, local=True, compute_grad=False)
+    else:
+        z_t, l1_w, seeds, pdict, x_best, fn_builder = best_pk_pack
+        n_hx = 1 + haze.n_asu
+        res_pw = minimize(fn_builder(prob.work, pdict, l1_w), x_best, method='L-BFGS-B', jac=True,
+                          bounds=b_loc + pdict.bounds(), options={'maxiter': 25, 'ftol': 1e-11, 'gtol': 1e-8})
+        rh_w, h_diag, _ = haze.forward_and_pullback(res_pw.x[:n_hx], local=True, compute_grad=False)
+        rp_w, _ = pdict.forward_and_pullback(res_pw.x[n_hx:], compute_grad=False)
+        rho_final = rh_w + haze.M_supp * np.maximum(rp_w, 0.0)
+        n_peaks_act = int(np.sum(res_pw.x[n_hx::5] > 0.05))
+        h_diag["f000_e"] = float(np.sum(rho_final) * cgrid.vox_vol)
+
+    ev_end = prob.eval_rho(rho_final, active_mask=prob.work, compute_grad=False)
+    info = {
+        "selected_stage": best_stage,
+        "r_val": float(best_rv),
+        "r_val_base": float(rval_base),
+        "r_val_haze_uniform": float(rval_u),
+        "r_val_haze_local": float(rval_l),
+        "r_val_haze_peak": float(rval_hp) if math.isfinite(rval_hp) else None,
+        "r_train": float(ev_end["r_train"]),
+        "h_mean": round(float(h_diag["h_mean"]), 4),
+        "h_p90": round(float(h_diag["h_p90"]), 4),
+        "f000_init_e": round(float(haze.f000_init), 3),
+        "f000_final_e": round(float(h_diag["f000_e"]), 3),
+        "n_peaks_act": int(n_peaks_act),
+        "B_haze": float(B_haze),
+        "fwhm_A": float(haze.fwhm_A),
+        "dt_s": round(time.time() - t0, 1),
+    }
+    return rho_final, info
