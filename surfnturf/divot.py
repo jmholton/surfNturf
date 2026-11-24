@@ -265,7 +265,7 @@ class CrystalGridOps:
 
 
 def build_open_solvent_envelope(cgrid: CrystalGridOps, pdb_path, r_vdw=2.15, width=0.18, smooth_B=8.0):
-    """Compute occupancy-weighted open-solvent fraction f_open(x) in [0, 1] directly from PDB altlocs & occupancies."""
+    """Compute occupancy-weighted open-solvent fraction f_open(x) in [0, 1] across all neighboring atoms & altlocs."""
     st = gemmi.read_structure(pdb_path)
     by_alt = {}
     blank_items = []
@@ -283,36 +283,52 @@ def build_open_solvent_envelope(cgrid: CrystalGridOps, pdb_path, r_vdw=2.15, wid
                     by_alt.setdefault(a.altloc, []).append((pos, min(float(a.occ), 1.0)))
 
     asu_pts = cgrid.asu_xyz
-    blocked_asu = np.zeros(cgrid.n_asu, dtype=np.float64)
+    tree_asu = cKDTree(asu_pts)
     cut_env = float(r_vdw) + 6.0 * float(width)
 
+    open_blank = np.ones(cgrid.n_asu, dtype=np.float64)
     if blank_items:
         xyz_b = np.array([it[0] for it in blank_items], dtype=np.float64)
         occ_b = np.array([it[1] for it in blank_items], dtype=np.float64)
         sx, so = cgrid.sym_expand_xyz(xyz_b, cutoff_A=cut_env, occ_arr=occ_b)
         if len(sx):
-            d_b, idx_b = cKDTree(sx).query(asu_pts)
-            blocked_asu += so[idx_b] * expit((r_vdw - d_b) / width)
+            nb = tree_asu.query_ball_point(sx, cut_env)
+            lens = np.array([len(x) for x in nb], dtype=np.int32)
+            if lens.sum() > 0:
+                ai = np.repeat(np.arange(len(sx), dtype=np.int32), lens)
+                pi = np.concatenate([np.asarray(x, dtype=np.int32) for x in nb if len(x)])
+                d_b = np.linalg.norm(asu_pts[pi] - sx[ai], axis=1)
+                p_blk = np.clip(so[ai] * expit((r_vdw - d_b) / width), 0.0, 1.0 - 1e-12)
+                log_open = np.bincount(pi, weights=np.log1p(-p_blk), minlength=cgrid.n_asu)
+                open_blank = np.exp(log_open)
 
+    blocked_alt = np.zeros(cgrid.n_asu, dtype=np.float64)
     for alt, items in sorted(by_alt.items()):
         xyz_a = np.array([it[0] for it in items], dtype=np.float64)
         occ_a = np.array([it[1] for it in items], dtype=np.float64)
         sx, so = cgrid.sym_expand_xyz(xyz_a, cutoff_A=cut_env, occ_arr=occ_a)
         if len(sx):
-            d_a, idx_a = cKDTree(sx).query(asu_pts)
-            blocked_asu += so[idx_a] * expit((r_vdw - d_a) / width)
+            nb = tree_asu.query_ball_point(sx, cut_env)
+            lens = np.array([len(x) for x in nb], dtype=np.int32)
+            if lens.sum() > 0:
+                ai = np.repeat(np.arange(len(sx), dtype=np.int32), lens)
+                pi = np.concatenate([np.asarray(x, dtype=np.int32) for x in nb if len(x)])
+                d_a = np.linalg.norm(asu_pts[pi] - sx[ai], axis=1)
+                blk_cur = np.zeros(cgrid.n_asu, dtype=np.float64)
+                np.maximum.at(blk_cur, pi, so[ai] * expit((r_vdw - d_a) / width))
+                blocked_alt += blk_cur
 
-    f_open_asu = np.clip(1.0 - blocked_asu, 0.0, 1.0)
+    f_open_asu = np.clip(open_blank * np.clip(1.0 - blocked_alt, 0.0, 1.0), 0.0, 1.0)
     f_open_3d = f_open_asu[cgrid.full_to_asu].reshape(cgrid.shape)
     if smooth_B > 0.0:
         f_open_3d = np.clip(cgrid.sym_s(cgrid.gaussian_blur(f_open_3d, smooth_B)), 0.0, 1.0)
     return f_open_3d
 
 
-def build_solvent_support_mask(base_3d, open_mask_3d, base_thresh=0.010, open_floor=0.25, open_span=0.15):
-    """Smooth [0, 1] support mask that is identically 0 deep inside the excluded protein core (`base == 0` & `open <= 0.25`)
-    and 1 throughout hydration shells (`base >= 0.010 e/A^3`) and open cavities/channels (`open >= 0.40`)."""
-    b = np.asarray(base_3d, dtype=np.float64)
+def build_solvent_support_mask(base_3d, open_mask_3d, base_thresh=0.010, base_floor=5e-4, open_floor=0.25, open_span=0.15):
+    """Smooth [0, 1] support mask that is identically 0 deep inside the excluded protein core (`base <= base_floor` &
+    `open <= 0.25`) and 1 throughout hydration shells (`base >= 0.0105 e/A^3`) and open cavities (`open >= 0.40`)."""
+    b = np.maximum(np.asarray(base_3d, dtype=np.float64) - float(base_floor), 0.0)
     om = np.asarray(open_mask_3d, dtype=np.float64)
     return np.clip(np.maximum(b / float(base_thresh), (om - float(open_floor)) / float(open_span)), 0.0, 1.0)
 
@@ -1427,7 +1443,8 @@ def fit_adaptive_divot_peak_blind(prob: SolventAmplitudeProblem, cgrid: CrystalG
     ev_base = prob.eval_rho(base_3d, active_mask=prob.train, compute_grad=False)
     rval_base = ev_base['r_val'] if math.isfinite(ev_base['r_val']) else ev_base['r_train']
     rval_fmodel_in = prob.eval_fmodel_ref_r(prob.val)
-    rval_gate_ref = min(float(rval_base), float(rval_fmodel_in)) if math.isfinite(rval_fmodel_in) else float(rval_base)
+    # Keep gate strictly blind: compare candidates only against train-fitted `rval_base` (never unblind `rval_fmodel_in`)
+    rval_gate_ref = float(rval_base)
 
     if min_rval_gain is None or str(min_rval_gain).strip().lower() == 'auto':
         n_val = max(int(np.sum(prob.val)), 1)

@@ -53,10 +53,10 @@ def check_crystal_compatibility(cell_a: gemmi.UnitCell, sg_a: gemmi.SpaceGroup, 
                                 rel_tol: float = 0.01, ang_tol: float = 1.0) -> bool:
     """Warn on stderr if two crystallographic inputs disagree in space group or unit-cell parameters."""
     ok = True
-    if sg_a is not None and sg_b is not None and sg_a.number != sg_b.number:
+    if sg_a is not None and sg_b is not None and sg_a.xhm() != sg_b.xhm():
         print(
-            f"surfnturf warning: space group mismatch between {desc_a} ({sg_a.hm!r}, #{sg_a.number}) "
-            f"and {desc_b} ({sg_b.hm!r}, #{sg_b.number})",
+            f"surfnturf warning: space group mismatch between {desc_a} ({sg_a.xhm()!r}, #{sg_a.number}) "
+            f"and {desc_b} ({sg_b.xhm()!r}, #{sg_b.number})",
             file=sys.stderr,
         )
         ok = False

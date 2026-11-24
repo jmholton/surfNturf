@@ -107,7 +107,6 @@ SP2_CARBONS = {
 _BACKBONE_Q = {
     'N': -0.4157, 'H': 0.2719, 'HN': 0.2719, 'CA': 0.0321, 'HA': 0.0823,
     'HA2': 0.0823, 'HA3': 0.0823, 'C': 0.5973, 'O': -0.5679, 'OXT': -0.7850,
-    'H1': 0.3854, 'H2': 0.3854, 'H3': 0.3854,
 }
 
 _SIDECHAIN_Q = {
@@ -318,8 +317,9 @@ class ASUGrid:
     def sym_expand(self, xyz, margin=None, cutoff_A=R_CUT, dedup_self: bool = False):
         """Expand Cartesian coordinates by all space-group and lattice images within `cutoff_A` of [0, 1)^3.
 
-        When `dedup_self=True`, solute atoms sitting on or within 0.25 A of crystallographic special positions
-        emit only one image per coincident self-orbit so PMF/OZ/Epol spline potentials are never multiplied 2x-6x.
+        When `dedup_self=True`, solute atoms whose symmetry self-images fall within 0.25 A of one another (e.g. within
+        0.125 A of a 2-fold rotation axis) emit only one image per coincident self-orbit so PMF/OZ/Epol spline
+        potentials are never multiplied 2x-6x. Pre-filtering stabilizers in O(n_ops * N) keeps high-symmetry groups fast.
         """
         if len(xyz) == 0:
             return np.zeros((0, 3)), np.zeros(0, dtype=np.int32)
@@ -341,22 +341,35 @@ class ASUGrid:
         out_p, out_i = [], []
         lo = -m_vec[None, :]
         hi = 1.0 + m_vec[None, :]
-        prev_gs = []
-        for op in self.ops:
-            R = np.array(op.rot, dtype=np.float64) / op.DEN
-            t = np.array(op.tran, dtype=np.float64) / op.DEN
+        op_mats = [(np.array(op.rot, dtype=np.float64) / op.DEN, np.array(op.tran, dtype=np.float64) / op.DEN)
+                   for op in self.ops]
+        spec_idx = None
+        prev_spec_gs = []
+        if dedup_self and len(op_mats) > 1:
+            is_spec = np.zeros(len(f), dtype=bool)
+            for Rc, tc in op_mats:
+                if np.all(np.abs(Rc - np.eye(3)) < 1e-9) and np.all(np.abs(np.mod(tc + 0.5, 1.0) - 0.5) < 1e-9):
+                    continue
+                df0 = np.mod((f @ Rc.T + tc) - f + 0.5, 1.0) - 0.5
+                is_spec |= (np.sum((df0 @ self.O.T) ** 2, axis=1) < 0.0625)
+            if np.any(is_spec):
+                spec_idx = np.nonzero(is_spec)[0]
+
+        for R, t in op_mats:
             g = f @ R.T + t
             g -= np.floor(g)
             active_atom = None
-            if dedup_self and len(self.ops) > 1:
-                if prev_gs:
-                    dup = np.zeros(len(f), dtype=bool)
-                    for gp in prev_gs:
-                        df = np.mod(g - gp + 0.5, 1.0) - 0.5
-                        d2 = np.sum((df @ self.O.T) ** 2, axis=1)
-                        dup |= (d2 < 0.0625)  # (0.25 A)^2
-                    active_atom = ~dup
-                prev_gs.append(g)
+            if spec_idx is not None:
+                gs = g[spec_idx]
+                if prev_spec_gs:
+                    dup_s = np.zeros(len(spec_idx), dtype=bool)
+                    for gp in prev_spec_gs:
+                        df = np.mod(gs - gp + 0.5, 1.0) - 0.5
+                        dup_s |= (np.sum((df @ self.O.T) ** 2, axis=1) < 0.0625)
+                    if np.any(dup_s):
+                        active_atom = np.ones(len(f), dtype=bool)
+                        active_atom[spec_idx[dup_s]] = False
+                prev_spec_gs.append(gs)
             for s in shifts:
                 h = g + s
                 m = np.all((h >= lo) & (h < hi), axis=1)
@@ -444,11 +457,21 @@ def assign_atom_partial_charges(atom_list, bonded_h_by_idx, bonded_hv_by_idx):
             q[i] = -0.7850
             continue
 
+        # Topology-based N-terminal cationic amine (NH3+ / PRO NH2+), independent of H atom naming (H1/H2/H3 vs H/H2/H3)
+        _na_names = ('A', 'C', 'G', 'U', 'DA', 'DC', 'DG', 'DT', 'ADE', 'CYT', 'GUA', 'URI', 'THY')
+        if an == 'N' and len(bonded_h_by_idx[i]) >= 2 and rn not in _na_names:
+            q[i] = -0.2548 if rn == 'PRO' else -0.3000
+            continue
+        if el in ('H', 'D') and bonded_hv_by_idx[i] and rn not in _na_names:
+            p_idx = bonded_hv_by_idx[i][0]
+            if atom_list[p_idx][2].strip().upper() == 'N' and len(bonded_h_by_idx[p_idx]) >= 2:
+                n_nh = len(bonded_h_by_idx[p_idx])
+                q[i] = (1.0000 / n_nh) if rn == 'PRO' else (1.1562 / n_nh)
+                continue
+
         if rn in ('HIS', 'HID', 'HIE', 'HIP'):
             is_hip = (rn == 'HIP') or (res_his_nd1_h.get(rkey, False) and res_his_ne2_h.get(rkey, False))
-            if an == 'N' and len(bonded_h_by_idx[i]) >= 2:
-                q[i] = -0.3000
-            elif an in _BACKBONE_Q:
+            if an in _BACKBONE_Q:
                 q[i] = _BACKBONE_Q[an]
             elif an == 'CG':
                 q[i] = 0.1600 if is_hip else 0.0442
@@ -465,18 +488,10 @@ def assign_atom_partial_charges(atom_list, bonded_h_by_idx, bonded_hv_by_idx):
                 q[i] = 0.5200 if is_hip else 0.3649
             elif el == 'C':
                 q[i] = -0.05 * len(bonded_h_by_idx[i])
-            elif el == 'H':
+            elif el in ('H', 'D'):
                 q[i] = 0.05
             continue
 
-        if an == 'N' and len(bonded_h_by_idx[i]) >= 2:
-            q[i] = -0.2548 if rn == 'PRO' else -0.3000
-            continue
-        if rn == 'PRO' and an in ('H2', 'H3') and bonded_hv_by_idx[i]:
-            p_idx = bonded_hv_by_idx[i][0]
-            if atom_list[p_idx][2].strip().upper() == 'N' and len(bonded_h_by_idx[p_idx]) >= 2:
-                q[i] = 0.5000
-                continue
         if rn == 'CYS' and an in ('CB', 'SG') and (
             (an == 'SG' and len(bonded_h_by_idx[i]) == 0)
             or (an == 'CB' and any(
@@ -1099,7 +1114,8 @@ def build_asu_features(grid: ASUGrid, members, n_types=None, include_hpol=True,
     """Precompute per-member cubic B-spline tensors (and optional TetOZ / Epol features) on the ASU grid."""
     M = len(members)
     if n_types is None:
-        n_types = 13 if any(len(t) > 0 and np.any(t >= 10) for _, t in members) else 10
+        max_t = max((int(np.max(t)) for _, t in members if len(t) > 0), default=9)
+        n_types = 2 if max_t <= 1 else (13 if max_t >= 10 else 10)
     n_asu = grid.n_asu
     n_feat = int(n_types) * N_KNOTS
     two_type = (int(n_types) == 2)

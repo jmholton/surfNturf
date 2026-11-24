@@ -6,9 +6,11 @@ Implements two complementary mobility mechanisms:
      - Modulates first-shell excess mobility by local polar H-bond tethering N_tether^(m)(x),
      - Transitions smoothly beyond d_far (~4.5 A) to wide disordered bulk mobility B_far (up to B = 999+ A^2).
   2. Regularized |Fo| / difference-map spatial mobility field dz_asu(x) = S_ell(eta_asu):
-     - Continuous ASU log-mobility nudge field coupled across an ell = 3.2 A neighborhood, fitted under either
-       strict `kmask_mode='fixed_one'` (`k_mask == 1.000` across all shells, eliminating gauge collinearity between
-       local B(x) and per-bin k_mask(s)) or `'per_bin'`.
+     - Continuous ASU log-mobility nudge field coupled across an ell = 3.2 A neighborhood, fitted under strict
+       `'fixed_one'` (`k_mask == 1.000` across all shells, default for `auto`/`uniform`/`phys`/`tb32`),
+       `'global_scalar'` (1 resolution-independent mother-liquor density multiplier `k_bulk = rho_mother / rho_water` in
+       `[0.65, 1.50]`), or `'per_bin'` (default for `joint`, eliminating gauge collinearity between local B(x) and
+       per-bin k_mask(s) whenever PMF splines are frozen).
 
 Rendering uses a 13-level C^1 Catmull-Rom partition-of-unity basis on ln B:
     B_levels = 5.0 * 2^(k - 3)  for k = 0..12  ([0.625 .. 2560.0] A^2, exact knot at 5.0 A^2).
@@ -481,7 +483,8 @@ def fast_build_asu_and_mobility(grid: ASUGrid, members, members_biso, n_types=No
     """Build `(Phi_O, Phi_H, steric_H, MobilityFeatures[, extra])` ~50x faster via `cKDTree(asu_xyz)`."""
     M = len(members)
     if n_types is None:
-        n_types = 13 if any(len(t) > 0 and np.any(t >= 10) for _, t in members) else 10
+        max_t = max((int(np.max(t)) for _, t in members if len(t) > 0), default=9)
+        n_types = 2 if max_t <= 1 else (13 if max_t >= 10 else 10)
     n_asu = grid.n_asu
     pts = grid.asu_xyz
     n_feat = int(n_types) * N_KNOTS
@@ -1583,18 +1586,28 @@ def fit_bmob_blind_gated(renderer, target: ReciprocalTarget, ds, mob_feat, cache
         renderer, targ_tr, ds, z_b5, cached_pmf=cached_pmf,
         displace_mode=displace_mode, keep_asu=keep_asu, compute_grad=False, kmask_mode=kmask_mode,
     )
+    out_0['z_mob_m'] = z_b5
     out_u = fit_uniform_B_on_work(
         renderer, targ_tr, ds, cached_pmf, displace_mode=displace_mode, keep_asu=keep_asu,
         kmask_mode=kmask_mode, maxiter=maxiter,
     )
+    if 'B_const' in out_u:
+        out_u['z_mob_m'] = np.full((1, ds.grid.n_asu), np.log(out_u['B_const']), dtype=np.float64)
     out_p = fit_physical_bmob_on_work(
         renderer, targ_tr, ds, mob_feat, cached_pmf, displace_mode=displace_mode, keep_asu=keep_asu,
         kmask_mode=kmask_mode, maxiter=maxiter,
     )
+    if 'z_phys' in out_p:
+        out_p['z_mob_m'] = out_p['z_phys']
     out_s = fit_spatial_bmob_on_work(
-        renderer, targ_tr, ds, out_p['z_phys'], cached_pmf, fwhm_A=fwhm_A, lam_z=lam_z,
+        renderer, targ_tr, ds, out_p.get('z_phys'), cached_pmf, fwhm_A=fwhm_A, lam_z=lam_z,
         displace_mode=displace_mode, keep_asu=keep_asu, kmask_mode=kmask_mode, maxiter=maxiter,
     )
+    for k_cp in ('psi', 'phys_params', 'z_phys'):
+        if k_cp in out_p:
+            out_s[k_cp] = out_p[k_cp]
+    if 'z_phys' in out_p and 'dz_asu' in out_s:
+        out_s['z_mob_m'] = out_p['z_phys'] + out_s['dz_asu'][None, :]
 
     stages = [('0shot', out_0), ('uniform', out_u), ('phys', out_p), ('spatial', out_s)]
     rval_table = {}

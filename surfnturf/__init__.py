@@ -88,6 +88,22 @@ try:
         fit_adaptive_divot_peak_blind,
         write_fpart_cgrid,
     )
+    from .chemfit import (
+        CHEM_KNOB_NAMES,
+        CrystalChemAdapter,
+        ChemicalSiteBasis,
+        build_chemical_site_basis,
+        chem_loss_and_grad,
+        eval_blind_rval_chem,
+        apply_confident_chemistry_to_pdb,
+        fit_chemistry_blind_gated,
+    )
+    from .micelle import (
+        MICELLE_PARAM_NAMES,
+        detect_transmembrane_belt,
+        AmphiphilicMicelleModel,
+        fit_micelle_blind,
+    )
     from .train import fit_surfnturf_model
 except ImportError:
     # Allow `from surfnturf.reconnect import ...` in pure-stdlib Python environments lacking numpy/scipy/gemmi
@@ -173,5 +189,17 @@ __all__ = [
     "fit_periodic_arm",
     "fit_adaptive_divot_peak_blind",
     "write_fpart_cgrid",
+    "CHEM_KNOB_NAMES",
+    "CrystalChemAdapter",
+    "ChemicalSiteBasis",
+    "build_chemical_site_basis",
+    "chem_loss_and_grad",
+    "eval_blind_rval_chem",
+    "apply_confident_chemistry_to_pdb",
+    "fit_chemistry_blind_gated",
+    "MICELLE_PARAM_NAMES",
+    "detect_transmembrane_belt",
+    "AmphiphilicMicelleModel",
+    "fit_micelle_blind",
     "fit_surfnturf_model",
 ]

@@ -296,7 +296,7 @@ def _cmd_fit_bmob(args):
 
     km_mode = args.kmask_mode
     if km_mode == "auto":
-        km_mode = "per_bin" if args.mode == "joint" else "global_scalar"
+        km_mode = "per_bin" if args.mode == "joint" else "fixed_one"
 
     fwhm_arg = "auto" if str(args.fwhm).strip().lower() == "auto" else float(args.fwhm)
     lam_arg = "auto" if str(args.lam_z).strip().lower() == "auto" else float(args.lam_z)
@@ -355,58 +355,100 @@ def _cmd_fit_bmob(args):
             r_tr, r_vl, r_wk, r_fr = target_full.eval_blind_rval(fp_post, kmask_mode=km_mode)
             out["r_train"], out["r_val"], out["r_work"], out["r_free"] = r_tr, r_vl, r_wk, r_fr
 
-    if not args.no_holdout_val and "r_val" not in out:
-        r_tr, r_vl, r_wk, r_fr = target_full.eval_blind_rval(out["f_part"], kmask_mode=km_mode)
-        out["r_train"], out["r_val"], out["r_work"], out["r_free"] = r_tr, r_vl, r_wk, r_fr
+    if not args.no_holdout_val:
+        if "r_val" not in out:
+            r_tr, r_vl, r_wk, r_fr = target_full.eval_blind_rval(out["f_part"], kmask_mode=km_mode)
+            out["r_train"], out["r_val"], out["r_work"], out["r_free"] = r_tr, r_vl, r_wk, r_fr
         out["r_val_fmodel_ref"] = target_full.eval_fmodel_ref_rval()
 
     summarize_bmob_microenvironments(mode_desc, out["B_eff_asu"], mob_asu, wts)
     solv_3d = out["solv_3d"]
     bulk_str = ""
     if km_mode == "global_scalar":
-        _, kb_w = target_full._solve_global_scalar_k0_kb(out["f_part"], target_full.work_mask)
-        solv_3d = kb_w * solv_3d
-        bulk_str = f", rho_bulk={kb_w * RHO_BULK:.4f} e/A^3 (k_bulk={kb_w:.3f})"
+        # Strictly solve k_bulk on targ_fit.work_mask (train_mask when holdout val is active!) so val_mask never leaks
+        _, kb_fit = target_full._solve_global_scalar_k0_kb(out["f_part"], targ_fit.work_mask)
+        solv_3d = kb_fit * solv_3d
+        bulk_str = f", rho_bulk={kb_fit * RHO_BULK:.4f} e/A^3 (k_bulk={kb_fit:.3f})"
+
     out_dir = os.path.dirname(os.path.abspath(args.out))
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
-    write_ccp4(f"{args.out}_solvent.ccp4", solv_3d, cell, sg)
     ref_mtz = args.hkl or args.fmodel_mtz
-    write_fpart_mtz_on_hkl(solv_3d, cell, ref_mtz, f"{args.out}_fpart.mtz", sg=sg)
 
     rv_str = ""
     rv_ref = out.get("r_val_fmodel_ref", float("nan"))
     used_fallback = False
-    if (args.fallback_fmodel and not args.no_holdout_val and math.isfinite(rv_ref)
-            and math.isfinite(out.get("r_val", float("nan"))) and rv_ref < out["r_val"] - 0.002):
+    if args.fallback_fmodel and not args.no_holdout_val and math.isfinite(out.get("r_val", float("nan"))):
         fm_in = gemmi.read_mtz_file(args.fmodel_mtz)
         fm_arr = np.array(fm_in, copy=False)
         fm_cmap = {l.upper().replace("-", "").replace("_", ""): fm_arr[:, i] for i, l in enumerate(fm_in.column_labels())}
         fk_a = fm_cmap.get("FMASK") if "FMASK" in fm_cmap else fm_cmap.get("FPART")
         fk_p = (fm_cmap.get("PHIFMASK") if "PHIFMASK" in fm_cmap else
                 (fm_cmap.get("PHIFPART") if "PHIFPART" in fm_cmap else fm_cmap.get("PHIPART")))
-        km_c = fm_cmap.get("KMASK", np.ones(len(fm_arr), dtype=np.float32))
         if fk_a is not None and fk_p is not None:
-            rm = gemmi.read_mtz_file(ref_mtz)
-            H_ref = np.asarray(rm.make_miller_array(), dtype=np.int32)
-            H_fm = fm_arr[:, :3].astype(np.int32)
-            lut = {(int(h[0]), int(h[1]), int(h[2])): (float(km_c[i] * fk_a[i]), float(fk_p[i])) for i, h in enumerate(H_fm)}
-            amp_out = np.zeros(len(H_ref), dtype=np.float32)
-            phi_out = np.zeros(len(H_ref), dtype=np.float32)
-            for i, h in enumerate(H_ref):
-                ap = lut.get((int(h[0]), int(h[1]), int(h[2])))
-                if ap is not None:
-                    amp_out[i], phi_out[i] = ap
-            mtz_fb = gemmi.Mtz(with_base=True)
-            mtz_fb.cell = rm.cell
-            mtz_fb.spacegroup = rm.spacegroup
-            mtz_fb.add_dataset("bulk")
-            mtz_fb.add_column("FPART", "F")
-            mtz_fb.add_column("PHIPART", "P")
-            mtz_fb.set_data(np.column_stack([H_ref, amp_out, phi_out]).astype(np.float32))
-            mtz_fb.write_to_file(f"{args.out}_fpart.mtz")
-            used_fallback = True
-            mode_desc = f"{mode_desc}->fallback_fmodel"
+            H_fm = fm_arr[:, :3].astype(np.int64)
+            Fk_src = fk_a.astype(np.float64) * np.exp(1j * np.deg2rad(fk_p.astype(np.float64)))
+            # Build full symmetry + Friedel complex lookup with exact translational phase factors
+            sym_lut = {}
+            for op in sg.operations():
+                R_op = np.array(op.rot, dtype=np.int64) // op.DEN
+                t_op = np.array(op.tran, dtype=np.float64) / op.DEN
+                H_rot = H_fm @ R_op
+                ph_shift = np.exp(-2j * np.pi * (H_fm @ t_op))
+                F_rot = Fk_src * ph_shift
+                for h_r, f_r in zip(H_rot, F_rot):
+                    k_pos = (int(h_r[0]), int(h_r[1]), int(h_r[2]))
+                    if k_pos not in sym_lut and np.isfinite(f_r):
+                        sym_lut[k_pos] = complex(f_r)
+                    k_neg = (-k_pos[0], -k_pos[1], -k_pos[2])
+                    if k_neg not in sym_lut and np.isfinite(f_r):
+                        sym_lut[k_neg] = complex(np.conj(f_r))
+            Fk_targ = np.array([sym_lut.get((int(h[0]), int(h[1]), int(h[2])), 0.0 + 0.0j)
+                                for h in target_full.hkl], dtype=np.complex128)
+            _, rv_fb_blind, rw_fb, rf_fb = target_full.eval_blind_rval(Fk_targ, kmask_mode="per_bin")
+            if math.isfinite(rv_fb_blind) and rv_fb_blind < out["r_val"] - 0.002:
+                from .field import fit_kmask_per_bin
+                _, k_tr_hkl = fit_kmask_per_bin(
+                    target_full.f_calc, Fk_targ, target_full.k_tot, target_full.f_obs, targ_fit.work_mask,
+                    target_full.bin_idx, target_full.n_bins, loss_type="l2", k_bounds=(0.0, 3.0),
+                )
+                # Map train-scaled fallback FPART onto ref_mtz via symmetry lookup & reconstruct matching 3D map
+                Fk_scaled_lut = {}
+                for op in sg.operations():
+                    R_op = np.array(op.rot, dtype=np.int64) // op.DEN
+                    t_op = np.array(op.tran, dtype=np.float64) / op.DEN
+                    H_rot = target_full.hkl @ R_op
+                    F_rot = (k_tr_hkl * Fk_targ) * np.exp(-2j * np.pi * (target_full.hkl @ t_op))
+                    for h_r, f_r in zip(H_rot, F_rot):
+                        kp = (int(h_r[0]), int(h_r[1]), int(h_r[2]))
+                        if kp not in Fk_scaled_lut:
+                            Fk_scaled_lut[kp] = complex(f_r)
+                        kn = (-kp[0], -kp[1], -kp[2])
+                        if kn not in Fk_scaled_lut:
+                            Fk_scaled_lut[kn] = complex(np.conj(f_r))
+                rm = gemmi.read_mtz_file(ref_mtz)
+                H_ref = np.asarray(rm.make_miller_array(), dtype=np.int32)
+                F_ref = np.array([Fk_scaled_lut.get((int(h[0]), int(h[1]), int(h[2])), 0.0 + 0.0j)
+                                  for h in H_ref], dtype=np.complex128)
+                mtz_fb = gemmi.Mtz(with_base=True)
+                mtz_fb.cell = rm.cell
+                mtz_fb.spacegroup = rm.spacegroup
+                mtz_fb.add_dataset("bulk")
+                mtz_fb.add_column("FPART", "F")
+                mtz_fb.add_column("PHIPART", "P")
+                mtz_fb.set_data(np.column_stack([H_ref, np.abs(F_ref), np.degrees(np.angle(F_ref))]).astype(np.float32))
+                mtz_fb.write_to_file(f"{args.out}_fpart.mtz")
+
+                gg_fb = mtz_fb.transform_f_phi_to_map("FPART", "PHIPART", sample_rate=2.2)
+                write_ccp4(f"{args.out}_solvent.ccp4", np.maximum(np.array(gg_fb, copy=True, dtype=np.float64), 0.0), cell, sg)
+                out["r_val"], out["r_work"], out["r_free"] = rv_fb_blind, rw_fb, rf_fb
+                used_fallback = True
+                bulk_str = ""
+                mode_desc = f"{mode_desc}->fallback_fmodel"
+
+    if not used_fallback:
+        write_ccp4(f"{args.out}_solvent.ccp4", solv_3d, cell, sg)
+        write_fpart_mtz_on_hkl(solv_3d, cell, ref_mtz, f"{args.out}_fpart.mtz", sg=sg)
 
     if not args.no_holdout_val and math.isfinite(out.get("r_val", float("nan"))):
         rv_str = f", blind r_val={100.0 * out['r_val']:.2f}%"
@@ -465,11 +507,12 @@ def _cmd_fit_divot(args):
         check_crystal_compatibility(cell, sg, str(args.base_ccp4), fm_cell, fm_sg, str(args.fmodel_mtz))
     else:
         gsp = _nyquist_safe_grid_spacing(float(args.grid), d_hi)
+        wx, wo = extract_ordered_waters(args.pdb)
+        bm_pre = "dry_a4" if (len(wx) == 0 or args.ignore_waters) else "wet_b5b"
         cell, sg, grid, _, _, _, solv_3d = predict_maps_for_target(
             args.pdb, weights=args.weights, grid_spacing=gsp, nconf=args.nconf,
-            complete_h=not args.no_complete_h,
+            bmob_preset=bm_pre, complete_h=not args.no_complete_h,
         )
-        wx, wo = extract_ordered_waters(args.pdb)
         if len(wx) > 0 and not args.ignore_waters:
             base_3d, _, _ = displace_ordered_waters(grid, solv_3d, wx, wo)
         else:
@@ -523,12 +566,254 @@ def _cmd_fit_divot(args):
         f"(blind r_val={100.0 * info.get('r_val', 0.0):.2f}%, k_solv/k_prot={ev['p'][1] / max(ev['p'][0], 1e-8):.3f}) "
         f"-> wrote {args.out}_solvent.ccp4, {args.out}_fpart.mtz"
     )
-    if ev['p'][1] <= prob.K_SOLV_MIN + 1e-6:
+    if prob.k_solv_mode == "free" and ev['p'][1] <= prob.K_SOLV_MIN + 1e-6:
         print(
             f"surfnturf warning: k_solv ended at its floor ({prob.K_SOLV_MIN}): the work data reject this solvent map "
             f"at any positive scale, so the written FPART is nearly empty. Check the base map, symmetry and cell.",
             file=sys.stderr,
         )
+
+
+def _cmd_fit_chem(args):
+    from .bmob import (
+        SlimDatasetBundle,
+        MultiBRenderer,
+        load_ensemble_with_bfac,
+        fast_build_asu_and_mobility,
+        reduce_mobility_features_to_asu,
+        compute_pmf_density_with_pullback,
+        build_water_keep_mask_asu,
+        fit_bmob_blind_gated,
+        load_reciprocal_target_from_fmodel_mtz,
+    )
+    from .chemfit import (
+        build_chemical_site_basis,
+        fit_chemistry_blind_gated,
+        apply_confident_chemistry_to_pdb,
+    )
+
+    spec, theta = load_saved_spec_and_theta(args.weights)
+    data_mtz_ref = args.data_mtz or args.hkl
+    target_full, cell, sg = load_reciprocal_target_from_fmodel_mtz(
+        args.fmodel_mtz, n_bins=args.bins, data_mtz_path=data_mtz_ref, free_flag_value=args.free_flag_value
+    )
+    st_pdb = _sample_structure_for_target(args.pdb)
+    if st_pdb.cell.is_crystal():
+        pdb_cell, pdb_sg = resolve_crystal_symmetry(st_pdb.cell, st_pdb.spacegroup_hm, source_desc=str(args.pdb))
+        check_crystal_compatibility(pdb_cell, pdb_sg, str(args.pdb), cell, sg, str(args.fmodel_mtz))
+
+    if args.shape:
+        shape = tuple(int(x) for x in args.shape.split(","))
+    else:
+        d_hi = float(np.min(target_full.d_hkl))
+        hkl_check = target_full.hkl
+        if args.hkl and os.path.isfile(args.hkl):
+            rm = gemmi.read_mtz_file(args.hkl)
+            rm.update_reso()
+            d_hi = min(d_hi, float(rm.resolution_high()))
+            hkl_check = np.vstack([hkl_check, np.asarray(rm.make_miller_array(), dtype=np.int64)])
+        shape, _ = _choose_nyquist_safe_shape(cell, sg, float(args.grid), d_hi, hkl_check)
+
+    grid = ASUGrid(cell, sg, shape, step=1)
+    two_type = (spec.n_types == 2)
+    complete_h = not args.no_complete_h
+    members, bisos, wts = load_ensemble_with_bfac(
+        args.pdb, nconf=args.nconf, two_type_heavy_only=two_type, use_lp=spec.use_lp, complete_h=complete_h
+    )
+    Phi_O, Phi_H, steric_H, mob_feat, extra = fast_build_asu_and_mobility(
+        grid, members, bisos, n_types=spec.n_types, include_hpol=spec.use_hpol,
+        include_tet_oz=spec.use_tet_oz, include_epol=False, member_weights=wts, return_extra=True,
+    )
+    ds_slim = SlimDatasetBundle(
+        "chem", grid, B_map=5.0, Phi_O=Phi_O, Phi_H=Phi_H, steric_H=steric_H,
+        member_weights=wts, F_hbsol=extra["F_hbsol"], E_feats=None,
+    )
+    mob_asu = reduce_mobility_features_to_asu(mob_feat, wts)
+    renderer = MultiBRenderer(grid)
+    gO_0, gH_0, sk_0, _ = compute_pmf_density_with_pullback(spec, ds_slim, theta, need_grad=False)
+    cached_0 = (gO_0, gH_0, sk_0)
+
+    wx, wo = extract_ordered_waters(args.pdb)
+    disp_mode = "pre" if (args.displace == "auto" and len(wx) > 0) else (
+        "none" if args.displace == "auto" else args.displace
+    )
+    keep_asu = None
+    if disp_mode in ("pre", "post") and len(wx) > 0:
+        keep_asu, _ = build_water_keep_mask_asu(grid, wts @ gO_0, wx, wo)
+
+    km_mode = args.kmask_mode
+    # Fit baseline 3D mobility B(x) strictly on 90% train_mask (gated on val_mask) before adapting chemistry
+    if args.bmob_init == "b5":
+        z_mob_m = np.full((1, grid.n_asu), np.log(5.0), dtype=np.float64)
+        bmob_tag = "b5"
+    else:
+        bm_out = fit_bmob_blind_gated(
+            renderer, target_full, ds_slim, mob_asu, cached_0,
+            displace_mode=disp_mode, keep_asu=keep_asu, kmask_mode=km_mode, maxiter=35,
+        )
+        bmob_tag = bm_out["selected_stage"]
+        if "z_mob_m" in bm_out:
+            z_mob_m = bm_out["z_mob_m"]
+        elif bmob_tag == "0shot":
+            z_mob_m = np.full((1, grid.n_asu), np.log(5.0), dtype=np.float64)
+        elif bmob_tag == "uniform":
+            z_mob_m = np.full((1, grid.n_asu), np.log(bm_out["B_const"]), dtype=np.float64)
+        elif bmob_tag == "phys":
+            z_mob_m = bm_out["z_phys"]
+        else:
+            z_mob_m = bm_out["z_phys"] + bm_out["dz_asu"][None, :]
+
+    use_dfc = bool(args.out_pdb) or bool(args.atomic_dfc)
+    site_basis = None
+    if args.mode != "env":
+        site_basis = build_chemical_site_basis(
+            args.pdb, grid, spec, hkl=(target_full.hkl if use_dfc else None),
+            d_hkl=(target_full.d_hkl if use_dfc else None), max_sites=args.max_sites,
+        )
+
+    out = fit_chemistry_blind_gated(
+        spec, theta, ds_slim, renderer, target_full, z_mob_m,
+        site_basis=site_basis, mode=args.mode, kmask_mode=km_mode,
+        displace_mode=disp_mode, keep_asu=keep_asu, include_atomic_dfc=use_dfc,
+        maxiter=args.maxiter,
+    )
+
+    solv_3d = out["solv_3d"]
+    targ_tr = target_full.for_training_subset()
+    bulk_str = ""
+    if km_mode == "global_scalar":
+        from .chemfit import ReciprocalTarget as _RT
+        fc_eff = target_full.f_calc if (not use_dfc or out.get("dfc") is None) else (target_full.f_calc + out["dfc"])
+        t_tmp = _RT(target_full.hkl, target_full.f_obs, targ_tr.work_mask, target_full.free_mask,
+                    fc_eff, target_full.k_tot, target_full.bin_idx, target_full.n_bins, target_full.d_hkl,
+                    train_mask=target_full.train_mask, val_mask=target_full.val_mask, spacegroup=sg)
+        _, kb_fit = t_tmp._solve_global_scalar_k0_kb(out["f_part"], targ_tr.work_mask)
+        solv_3d = kb_fit * solv_3d
+        bulk_str = f", rho_bulk={kb_fit * RHO_BULK:.4f} e/A^3 (k_bulk={kb_fit:.3f})"
+
+    out_dir = os.path.dirname(os.path.abspath(args.out))
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    applied_edits = []
+    if args.out_pdb:
+        if out["selected_stage"] in ("sites", "joint") and out.get("site_probs") is not None:
+            applied_edits = apply_confident_chemistry_to_pdb(args.pdb, args.out_pdb, site_basis, out["site_probs"])
+        else:
+            apply_confident_chemistry_to_pdb(args.pdb, args.out_pdb, None, None)
+
+    write_ccp4(f"{args.out}_solvent.ccp4", solv_3d, cell, sg)
+    ref_mtz = args.hkl or args.fmodel_mtz
+    write_fpart_mtz_on_hkl(solv_3d, cell, ref_mtz, f"{args.out}_fpart.mtz", sg=sg)
+
+    summary = {
+        "selected_stage": out["selected_stage"],
+        "bmob_init": bmob_tag,
+        "kmask_mode": km_mode,
+        "r_train": round(float(out["r_train"]), 6),
+        "r_val": round(float(out["r_val"]), 6),
+        "r_work": round(float(out["r_work"]), 6),
+        "r_free": round(float(out["r_free"]), 6),
+        "r_val_table": out["r_val_table"],
+        "chem_knobs": out["chem_knobs"],
+        "n_sites_enumerated": out["n_sites_enumerated"],
+        "site_shifts": out["site_shifts"],
+        "applied_pdb_edits": applied_edits,
+    }
+    with open(f"{args.out}_chem.json", "w", encoding="utf-8", newline="\n") as jf:
+        json.dump(summary, jf, indent=2)
+
+    print(
+        f"fit-chem (bmob={bmob_tag}, stage={out['selected_stage']}, sites={out['n_sites_enumerated']}, "
+        f"shifts={len(out['site_shifts'])}{bulk_str}): internal R_work / R_free = "
+        f"{100.0 * out['r_work']:.2f}% / {100.0 * out['r_free']:.2f}%, blind r_val={100.0 * out['r_val']:.2f}% "
+        f"-> wrote {args.out}_solvent.ccp4, {args.out}_fpart.mtz, {args.out}_chem.json"
+    )
+
+
+def _cmd_fit_micelle(args):
+    from .divot import (
+        CrystalGridOps,
+        build_open_solvent_envelope,
+        extract_problem_from_fmodel,
+        write_fpart_cgrid,
+    )
+    from .micelle import fit_micelle_blind
+
+    fm_probe = gemmi.read_mtz_file(args.fmodel_mtz)
+    fm_probe.update_reso()
+    d_hi = float(fm_probe.resolution_high())
+    fm_cell, fm_sg = resolve_crystal_symmetry(
+        fm_probe.cell, fm_probe.spacegroup.hm if fm_probe.spacegroup is not None else "",
+        source_desc=str(args.fmodel_mtz),
+    )
+    st_pdb = _sample_structure_for_target(args.pdb)
+    if st_pdb.cell.is_crystal():
+        pdb_cell, pdb_sg = resolve_crystal_symmetry(st_pdb.cell, st_pdb.spacegroup_hm, source_desc=str(args.pdb))
+        check_crystal_compatibility(pdb_cell, pdb_sg, str(args.pdb), fm_cell, fm_sg, str(args.fmodel_mtz))
+
+    data_mtz_ref = args.data_mtz or args.hkl
+    if data_mtz_ref and os.path.isfile(data_mtz_ref):
+        dm_probe = gemmi.read_mtz_file(data_mtz_ref)
+        dm_probe.update_reso()
+        d_hi = min(d_hi, float(dm_probe.resolution_high()))
+
+    if args.base_ccp4:
+        base_3d, cell, sg, has_map_sg = read_ccp4_map_checked(args.base_ccp4)
+        if not has_map_sg and fm_sg.number != 1:
+            try:
+                _ = CrystalGridOps(cell, fm_sg, base_3d.shape, conv="plus", fft_workers=1)
+                sg = fm_sg
+            except ValueError:
+                pass
+        check_crystal_compatibility(cell, sg, str(args.base_ccp4), fm_cell, fm_sg, str(args.fmodel_mtz))
+    else:
+        gsp = _nyquist_safe_grid_spacing(float(args.grid), d_hi)
+        wx, wo = extract_ordered_waters(args.pdb)
+        bm_pre = "dry_a4" if (len(wx) == 0 or args.ignore_waters) else "wet_b5b"
+        cell, sg, grid, _, _, _, solv_3d = predict_maps_for_target(
+            args.pdb, weights=args.weights, grid_spacing=gsp, nconf=args.nconf,
+            bmob_preset=bm_pre, complete_h=not args.no_complete_h,
+        )
+        if len(wx) > 0 and not args.ignore_waters:
+            base_3d, _, _ = displace_ordered_waters(grid, solv_3d, wx, wo)
+        else:
+            base_3d = solv_3d
+
+    cgrid = CrystalGridOps(cell, sg, base_3d.shape, conv="plus", fft_workers=args.workers)
+    prob = extract_problem_from_fmodel(
+        cgrid, args.fmodel_mtz, data_mtz_path=data_mtz_ref,
+        free_flag_value=args.free_flag_value, k_solv_mode=args.k_solv_mode,
+    )
+    open_mask = build_open_solvent_envelope(cgrid, args.pdb)
+    rho_opt, info = fit_micelle_blind(
+        prob, cgrid, base_3d, args.pdb, open_3d=open_mask,
+        force_micelle=bool(args.force_micelle), gate_on_val=(not args.no_val_gate), maxiter=args.maxiter,
+    )
+    rho_scaled, ev = prob.scaled_solvent_rho(rho_opt, active_mask=prob.work)
+    out_dir = os.path.dirname(os.path.abspath(args.out))
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    write_ccp4(f"{args.out}_solvent.ccp4", rho_scaled, cell, sg)
+    ref_mtz = args.hkl or args.data_mtz or args.fmodel_mtz
+    write_fpart_cgrid(cgrid, rho_scaled, ref_mtz, f"{args.out}_fpart.mtz", col_names=("FPART", "PHIPART"))
+    with open(f"{args.out}_micelle.json", "w", encoding="utf-8", newline="\n") as jf:
+        json.dump(info, jf, indent=2)
+
+    st_sel = info["selected_stage"]
+    mic_str = ""
+    if st_sel == "micelle" and "micelle" in info:
+        mp = info["micelle"]["params"]
+        mic_str = (
+            f", L_tail={mp['L_tail_A']:.1f}A, w_head={mp['w_head_A']:.1f}A, "
+            f"rho_tail={mp['rho_tail_eA3']:.3f}, rho_head={mp['rho_head_eA3']:.3f} e/A^3"
+        )
+    print(
+        f"fit-micelle (stage={st_sel}{mic_str}): internal R_work / R_free = "
+        f"{100.0 * ev['r_work']:.2f}% / {100.0 * ev['r_free']:.2f}% "
+        f"(blind r_val={100.0 * info.get('r_val', 0.0):.2f}% vs base {100.0 * info.get('r_val_base', 0.0):.2f}%) "
+        f"-> wrote {args.out}_solvent.ccp4, {args.out}_fpart.mtz, {args.out}_micelle.json"
+    )
 
 
 def _cmd_train(args):
@@ -639,8 +924,8 @@ def build_parser() -> argparse.ArgumentParser:
     sb.add_argument("--weights", default="l2", help="Starting surfNturf weights ('l2', 'kl', 'v1_l2', 'v1_kl', or .npz).")
     sb.add_argument("--mode", default="auto", choices=["auto", "uniform", "phys", "tb32", "joint"],
                     help="Mobility fit mode ('auto' gates 0shot/uniform/phys/spatial on unseen 5%% work_val; default: auto).")
-    sb.add_argument("--kmask-mode", default="auto", choices=["auto", "global_scalar", "fixed_one", "per_bin"],
-                    help="Reciprocal k_mask ruler ('auto' uses 1-scalar mother-liquor density 'global_scalar' for auto/uniform/phys/tb32 and 'per_bin' for joint).")
+    sb.add_argument("--kmask-mode", default="auto", choices=["auto", "fixed_one", "global_scalar", "per_bin"],
+                    help="Reciprocal k_mask ruler ('auto' uses 'fixed_one' for auto/uniform/phys/tb32 and 'per_bin' for joint; 'global_scalar' fits 1 mother-liquor density scalar k_bulk in [0.65, 1.50]).")
     sb.add_argument("--fwhm", default="auto",
                     help="Spatial coupling FWHM in A or 'auto' -> 3.2 A for d_min <= 1.0 A, else max(3.2, 3.5*d_min) (default: auto).")
     sb.add_argument("--lam-z", default="auto",
@@ -678,6 +963,53 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Inner solvent scale mode ('fixed_one' locks k_solv==k_prot for calibrated e/A^3 maps; 'free' allows independent k_solv).")
     sd.add_argument("--workers", type=int, default=4, help="FFT worker threads (default: 4).")
     sd.set_defaults(func=_cmd_fit_divot)
+
+    # 5. fit-chem
+    sc = sub.add_parser("fit-chem", help="Feed 90%% work_train |Fo| back into mother-liquor & solute chemistry (5%% work_val gated, R-free untouched).")
+    sc.add_argument("--pdb", required=True, help="Input macromolecular model PDB/mmCIF.")
+    sc.add_argument("--fmodel-mtz", required=True, help="Phenix *_f_model.mtz (from export_final_f_model=True).")
+    sc.add_argument("--out", required=True, help="Output prefix for _solvent.ccp4, _fpart.mtz, and _chem.json.")
+    sc.add_argument("--out-pdb", default=None, help="Optional output PDB applying high-confidence ASN/GLN flips & REMARK 3 annotations.")
+    sc.add_argument("--hkl", default=None, help="Optional reference MTZ for output HKL list.")
+    sc.add_argument("--data-mtz", default=None, help="Optional original diffraction MTZ with 20-bin FreeR_flag for shared 90/5/5 split.")
+    sc.add_argument("--free-flag-value", type=int, default=None, help="R-free flag value marking the test set.")
+    sc.add_argument("--weights", default="l2", help="Starting surfNturf weights ('l2', 'kl', or .npz).")
+    sc.add_argument("--mode", default="auto", choices=["auto", "env", "sites", "joint"],
+                    help="Chemical feedback stage ('auto' gates base/env/sites/joint on unseen 5%% work_val; default: auto).")
+    sc.add_argument("--kmask-mode", default="global_scalar", choices=["global_scalar", "fixed_one", "per_bin"],
+                    help="Reciprocal mother-liquor scale mode (default: global_scalar).")
+    sc.add_argument("--bmob-init", default="auto", choices=["auto", "b5"], help="3D B(x) mobility baseline ('auto' or 'b5').")
+    sc.add_argument("--displace", default="auto", choices=["auto", "none", "pre", "post"], help="Ordered-water displacement mode.")
+    sc.add_argument("--atomic-dfc", action="store_true", help="Include direct IT92 atomic Delta F_calc during site inference even without --out-pdb.")
+    sc.add_argument("--max-sites", type=int, default=160, help="Maximum ambiguous solute chemical sites enumerated (default: 160).")
+    sc.add_argument("--grid", type=float, default=0.45, help="Grid spacing in A (default: 0.45).")
+    sc.add_argument("--shape", default=None, help="Explicit grid shape 'nu,nv,nw'.")
+    sc.add_argument("--nconf", type=int, default=32, help="Conformer count for multi-altloc models (default: 32).")
+    sc.add_argument("--bins", type=int, default=24, help="Resolution shells for per-bin k_mask (default: 24).")
+    sc.add_argument("--maxiter", type=int, default=45, help="Max L-BFGS-B iterations per stage (default: 45).")
+    sc.add_argument("--no-complete-h", action="store_true", help="Disable automatic riding-hydrogen completion.")
+    sc.set_defaults(func=_cmd_fit_chem)
+
+    # 6. fit-micelle
+    sm = sub.add_parser("fit-micelle", help="Fit 3-zone amphiphilic detergent micelle / lipid belt on 90%% work_train |Fo| (5%% work_val gated).")
+    sm.add_argument("--pdb", required=True, help="Input membrane-protein PDB/mmCIF (transmembrane belt & aqueous pores detected automatically).")
+    sm.add_argument("--fmodel-mtz", required=True, help="Phenix *_f_model.mtz (from export_final_f_model=True).")
+    sm.add_argument("--out", required=True, help="Output prefix for _solvent.ccp4, _fpart.mtz, and _micelle.json.")
+    sm.add_argument("--hkl", default=None, help="Optional reference MTZ for output HKL list / FreeR_flag.")
+    sm.add_argument("--data-mtz", default=None, help="Optional original diffraction MTZ with 20-bin FreeR_flag for shared 90/5/5 split.")
+    sm.add_argument("--free-flag-value", type=int, default=None, help="R-free flag value marking the test set.")
+    sm.add_argument("--base-ccp4", default=None, help="Optional starting aqueous solvent CCP4 map (e.g. from fit-bmob).")
+    sm.add_argument("--weights", default="l2", help="surfNturf weights when generating starting aqueous base (default: l2).")
+    sm.add_argument("--grid", type=float, default=0.45, help="Grid spacing in A when generating starting base (default: 0.45).")
+    sm.add_argument("--nconf", type=int, default=32, help="Conformer count when generating starting base (default: 32).")
+    sm.add_argument("--ignore-waters", action="store_true", help="Do not displace ordered HOH when generating starting base.")
+    sm.add_argument("--no-complete-h", action="store_true", help="Disable automatic riding-hydrogen completion when generating base.")
+    sm.add_argument("--force-micelle", action="store_true", help="Force micelle fit even if protein fails soluble-vs-membrane belt threshold.")
+    sm.add_argument("--no-val-gate", action="store_true", help="Disable blind 5%% work_val gate against aqueous base.")
+    sm.add_argument("--k-solv-mode", default="fixed_one", choices=["fixed_one", "free"], help="Inner solvent scale mode (default: fixed_one).")
+    sm.add_argument("--maxiter", type=int, default=45, help="Max L-BFGS-B iterations (default: 45).")
+    sm.add_argument("--workers", type=int, default=4, help="FFT worker threads (default: 4).")
+    sm.set_defaults(func=_cmd_fit_micelle)
 
     # 5. train
     st = sub.add_parser("train", help="Fit surfNturf hydration PMF+LP+TetOZ weights to MD solvent CCP4 maps.")
